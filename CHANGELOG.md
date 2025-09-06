@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.4 — Durable jobs, optional state filter, resume support
+- Persist job metadata to disk (`data/output/_jobs/<job_id>.json`) so status/download work even if the Render dyno sleeps or requests land on a different instance.
+- Add **heartbeat** + **auto-pause** detection: if a running job’s heartbeat is stale, status returns `"state":"paused"` with the last known percent.
+- Add `POST /classical/resume?job_id=...` to restart a paused/missing worker.
+- Keep progress contract the same (`state`, `message`, `percent`, `done`, `total`).
+- Make the **U.S. state filter optional** everywhere; accept both `state` and `state_name`.
+- CSV: unchanged (spec): columns `DATE, VALUE, ARIMA-M, ARIMA-Q, SES-M, SES-Q, HWES-M, HWES-Q`; filename `[TARGET_VALUE]_[STATE]_[COUNTY]_[CITY]_[CBSA]_[TYPE].csv`.
+
+
 ## 2.0.3 – Fix probe/start param handling
 - Make `state` **optional** and accept both `state` and `state_name` for `/classical/probe` and `/classical/start`.
 - `/classical/start` now accepts **JSON body** or **query params** (both supported).
