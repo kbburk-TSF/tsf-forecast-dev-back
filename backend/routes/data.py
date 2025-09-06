@@ -26,3 +26,24 @@ def last_date(state: str, parameter: str):
     with engine.begin() as conn:
         row = conn.execute(text(sql), {"state": state, "parameter": parameter}).first()
     return {"state": state, "parameter": parameter, "last_date": row[0] if row else None}
+    
+    from fastapi import HTTPException
+
+@router.get("/debug/air_quality/schema_live")
+def debug_air_quality_schema_live():
+    """
+    Returns the live column list from Neon for public.air_quality_raw.
+    """
+    sql = """
+    SELECT column_name, data_type, is_nullable
+    FROM information_schema.columns
+    WHERE table_schema='public' AND table_name='air_quality_raw'
+    ORDER BY ordinal_position
+    """
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text(sql)).mappings().all()
+        return {"table": "public.air_quality_raw", "columns": [dict(r) for r in rows]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
