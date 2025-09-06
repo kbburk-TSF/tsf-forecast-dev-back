@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.5 — Verbose progress + durable jobs
+- Add fine-grained progress messages: which model (ARIMA/SES/HWES) and which period (monthly or quarterly window) is running.
+- Keep jobs **durable** on disk; status shows `"paused"` when a heartbeat is stale and can be **resumed**.
+- New endpoint: `POST /classical/resume?job_id=...` to continue long jobs after Render sleep.
+- U.S. state filter remains **optional**; both `state` and `state_name` accepted and coalesced.
+- CSV unchanged (spec): `DATE, VALUE, ARIMA-M, ARIMA-Q, SES-M, SES-Q, HWES-M, HWES-Q`; filename `[TARGET_VALUE]_[STATE]_[COUNTY]_[CITY]_[CBSA]_[TYPE].csv`.
+
+
 ## 2.0.4 — Durable jobs, optional state filter, resume support
 - Persist job metadata to disk (`data/output/_jobs/<job_id>.json`) so status/download work even if the Render dyno sleeps or requests land on a different instance.
 - Add **heartbeat** + **auto-pause** detection: if a running job’s heartbeat is stale, status returns `"state":"paused"` with the last known percent.
