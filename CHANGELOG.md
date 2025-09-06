@@ -1,15 +1,16 @@
-## v1.0.9 — 2025-09-06
-- Added /data/{db}/targets endpoint to list available target variables.
-- Added /data/{db}/filters endpoint to list distinct filter values for a given target.
-- Updated main.py to include new meta router.
+# Changelog
 
-## v1.1.0 — 2025-09-06
-- Add CSV export endpoint: /forecast/export/state_daily
-- CSV columns: DATE, VALUE, FORECAST_VALUE
-- Filename: tsf-<db>-<state>-<target>-<agg>-<method>-<YYYYMMDD>.csv (db=demo_air_quality)
-
+## v1.2.1 — 2025-09-06
+- Fix Render startup error `ModuleNotFoundError: No module named 'psycopg'` by:
+  - Adding `psycopg[binary]` to requirements (psycopg3)
+  - Hardening `backend/database.py` to normalize the DATABASE_URL and explicitly select psycopg (v3) or psycopg2
 
 ## v1.2.0 — 2025-09-06
-- NEW: /classical/export_target -> writes F_[TARGET_VALUE]_[PARAMS]_[TYPE].csv (DATE,VALUE)
-- NEW: /classical/export_classical -> outputs ARIMA/SES/HWES Monthly & Quarterly with spec columns.
-- Dependencies: statsmodels, pmdarima.
+- NEW classical endpoints: `/classical/export_target` and `/classical/export_classical`
+- Spec-compliant filenames and columns; added statsmodels & pmdarima
+
+## v1.0.9 — 2025-09-06
+- Metadata endpoints: `/data/{db}/targets` and `/data/{db}/filters`
+
+## v1.0.8 — 2025-09-06
+- Align SQL with Neon’s live schema
