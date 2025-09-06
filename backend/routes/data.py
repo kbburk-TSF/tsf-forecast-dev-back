@@ -47,3 +47,15 @@ def debug_air_quality_schema_live():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/debug/tables")
+def debug_tables():
+    sql = """
+    SELECT table_schema, table_name
+    FROM information_schema.tables
+    WHERE table_type='BASE TABLE'
+    ORDER BY table_schema, table_name
+    """
+    with engine.begin() as conn:
+        rows = conn.execute(text(sql)).mappings().all()
+    return {"tables": [dict(r) for r in rows]}
+
