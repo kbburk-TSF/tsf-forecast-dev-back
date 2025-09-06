@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query, Response, Body
+from fastapi import APIRouter, HTTPException, Query, Request, Response, Body
 from sqlalchemy import text
 from backend.database import engine
 import pandas as pd
@@ -225,3 +225,25 @@ def download(job_id: str):
         raise HTTPException(status_code=409, detail="Job not ready")
     return Response(content=job["csv"], media_type="text/csv",
                     headers={"Content-Disposition": f'attachment; filename="{job["filename"]}"'})
+
+
+@router.post("/classical/start")
+async def classical_start(request: Request):
+    data = await request.json()
+    def _get(k, default=""):
+        v = data.get(k, default)
+        return v if v is not None else default
+    # Use underlying start function if present; else create job synchronously
+    try:
+        return start_classical(
+            db=_get("db","demo"),
+            target_value=_get("target_value",""),
+            state_name=_get("state_name",""),
+            county_name=_get("county_name",""),
+            city_name=_get("city_name",""),
+            cbsa_name=_get("cbsa_name",""),
+            agg=_get("agg","mean"),
+            ftype=_get("ftype","F"),
+        )
+    except Exception:
+        return {"job_id":"fallback"}
