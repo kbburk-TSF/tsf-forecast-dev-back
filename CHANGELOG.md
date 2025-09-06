@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.3.1 — SES-only stabilization (structure preserved)
+- Disable ARIMA & HWES; run **SES-M** and **SES-Q** only.
+- Durable job files: `backend/data/output/_jobs/<job_id>.json`.
+- Verbose progress messages (`SES-M i/N`, `SES-Q i/N`).
+- U.S. state filter optional; accepts `state` or `state_name`.
+- CSV columns: `DATE, VALUE, SES-M, SES-Q`; filename `[TARGET_VALUE]_[STATE]_[COUNTY]_[CITY]_[CBSA]_[TYPE].csv`.
+
+
 ## 2.0.5 — Verbose progress + durable jobs
 - Add fine-grained progress messages: which model (ARIMA/SES/HWES) and which period (monthly or quarterly window) is running.
 - Keep jobs **durable** on disk; status shows `"paused"` when a heartbeat is stale and can be **resumed**.
