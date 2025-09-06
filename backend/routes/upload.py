@@ -7,6 +7,9 @@ import io
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 
+DB_SCHEMA = "demo_air_quality"
+TABLE = f"{DB_SCHEMA}.air_quality_raw"
+
 HEADER_MAP = {
     "date local": "date_local",
     "date_local": "date_local",
@@ -48,7 +51,6 @@ def upload_air_quality_csv(
     df["date_local"] = pd.to_datetime(df["date_local"]).dt.date
     df["arithmetic_mean"] = pd.to_numeric(df["arithmetic_mean"], errors="coerce")
     df = df.dropna(subset=["date_local","arithmetic_mean"])
-
     for opt in ["local_site_name","county_name","city_name","cbsa_name"]:
         if opt not in df.columns:
             df[opt] = None
@@ -59,7 +61,7 @@ def upload_air_quality_csv(
     cols = ["date_local","parameter_name","arithmetic_mean","local_site_name","state_name","county_name","city_name","cbsa_name"]
     values_template = ",".join([f":{c}" for c in cols])
     insert_sql = f"""
-        INSERT INTO public.air_quality_raw ({",".join(cols)})
+        INSERT INTO {TABLE} ({",".join(cols)})
         VALUES ({values_template})
         {conflict_sql};
     """

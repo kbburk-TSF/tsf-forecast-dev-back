@@ -6,13 +6,16 @@ import pandas as pd
 
 router = APIRouter(prefix="/forecast", tags=["forecast"])
 
+DB_SCHEMA = "demo_air_quality"
+TABLE = f"{DB_SCHEMA}.air_quality_raw"
+
 @router.get("/state_daily")
 def forecast_state_daily(state: str, parameter: str, h: int = Query(30, ge=1, le=365),
                          agg: str = Query("mean", pattern="^(mean|sum)$"),
                          method: str = Query("seasonal_naive_dow", pattern="^(seasonal_naive_dow|ewma)$")):
-    sql = """
+    sql = f"""
     SELECT date_local::date AS date, arithmetic_mean AS value
-    FROM public.air_quality_raw
+    FROM {TABLE}
     WHERE state_name = :state AND parameter_name = :parameter
     ORDER BY date_local
     """
@@ -20,9 +23,12 @@ def forecast_state_daily(state: str, parameter: str, h: int = Query(30, ge=1, le
         rows = conn.execute(text(sql), {"state": state, "parameter": parameter}).mappings().all()
     if not rows:
         raise HTTPException(status_code=404, detail="No data for given filters")
+
     df = pd.DataFrame(rows)
     hist = df.groupby("date", as_index=False)["value"].mean() if agg == "mean" else df.groupby("date", as_index=False)["value"].sum()
+
     fc = forecast_seasonal_naive_dow(hist, h=h, lookback_weeks=8) if method == "seasonal_naive_dow" else forecast_ewma(hist, h=h, span=14)
+
     return {
         "state": state,
         "parameter": parameter,

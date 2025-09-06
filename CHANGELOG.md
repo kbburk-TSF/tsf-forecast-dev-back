@@ -18,3 +18,6 @@
 ## v1.0.3 — 2025-09-06
 - Ensure `/version` endpoint is present and bump version to verify deployment.
 
+## v1.0.7 — 2025-09-06
+- Hard-code schema to `demo_air_quality` across all route files.
+- Update all SQL queries to use `demo_air_quality.air_quality_raw`.
