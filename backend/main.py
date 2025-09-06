@@ -7,7 +7,7 @@ from backend.routes.meta import router as meta_router
 from backend.routes.classical import router as classical_router
 import os
 
-app = FastAPI(title="TSF Backend", version="1.3.0")
+app = FastAPI(title="TSF Backend", version="1.2.0")
 
 env_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
 allowed = [o.strip() for o in env_origins.split(",") if o.strip()] or ["*"]
