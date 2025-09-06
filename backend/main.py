@@ -36,3 +36,10 @@ def version():
             return {"version": f.read().strip()}
     except Exception:
         return {"version": "unknown"}
+
+
+from fastapi.middleware.cors import CORSMiddleware
+from backend.routes.classical import router as classical_router
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True)
+app.include_router(classical_router)
