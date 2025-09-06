@@ -14,3 +14,7 @@
 ## v1.0.2 — 2025-09-06
 - Add `/version` endpoint
 - Standardize `/health` to include `database`, `schema`, and `rows`
+
+## v1.0.3 — 2025-09-06
+- Ensure `/version` endpoint is present and bump version to verify deployment.
+

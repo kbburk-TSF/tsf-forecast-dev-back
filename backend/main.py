@@ -9,7 +9,7 @@ from backend.routes.data import router as data_router
 from backend.routes.aggregate import router as agg_router
 from backend.routes.forecast import router as forecast_router
 
-app = FastAPI(title="TSF Backend", version="1.0.2")
+app = FastAPI(title="TSF Backend", version="1.0.3")
 
 app.add_middleware(
     CORSMiddleware,
