@@ -19,7 +19,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include feature routes
+# Feature routes
 app.include_router(upload_router)
 app.include_router(data_router)
 app.include_router(agg_router)
@@ -60,9 +60,7 @@ def health():
 
 @app.get("/version")
 def version():
-    """
-    Returns the backend version from the VERSION file.
-    """
+    """Returns the backend version from the VERSION file."""
     v = "unknown"
     try:
         with open("VERSION", "r") as f:
