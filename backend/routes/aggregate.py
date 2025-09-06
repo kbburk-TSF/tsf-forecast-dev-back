@@ -11,10 +11,10 @@ TABLE = f"{DB_SCHEMA}.air_quality_raw"
 @router.get("/state_daily")
 def state_daily(state: str, parameter: str, agg: str = Query("mean", pattern="^(mean|sum)$")):
     sql = f"""
-    SELECT date_local::date AS date, arithmetic_mean AS value
+    SELECT "Date Local"::date AS date, "Arithmetic Mean" AS value
     FROM {TABLE}
-    WHERE state_name = :state AND parameter_name = :parameter
-    ORDER BY date_local
+    WHERE "State Name" = :state AND "Parameter Name" = :parameter
+    ORDER BY "Date Local"
     """
     with engine.begin() as conn:
         rows = conn.execute(text(sql), {"state": state, "parameter": parameter}).mappings().all()

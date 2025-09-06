@@ -14,10 +14,10 @@ def forecast_state_daily(state: str, parameter: str, h: int = Query(30, ge=1, le
                          agg: str = Query("mean", pattern="^(mean|sum)$"),
                          method: str = Query("seasonal_naive_dow", pattern="^(seasonal_naive_dow|ewma)$")):
     sql = f"""
-    SELECT date_local::date AS date, arithmetic_mean AS value
+    SELECT "Date Local"::date AS date, "Arithmetic Mean" AS value
     FROM {TABLE}
-    WHERE state_name = :state AND parameter_name = :parameter
-    ORDER BY date_local
+    WHERE "State Name" = :state AND "Parameter Name" = :parameter
+    ORDER BY "Date Local"
     """
     with engine.begin() as conn:
         rows = conn.execute(text(sql), {"state": state, "parameter": parameter}).mappings().all()
