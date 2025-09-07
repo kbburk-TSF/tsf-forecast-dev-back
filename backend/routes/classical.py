@@ -26,7 +26,7 @@ def _job_write(job_id: str, **data):
     data = dict(data); data["updated_at"] = time.time()
     with open(_job_path(job_id), "w", encoding="utf-8") as f: json.dump(data, f)
 def _job_read(job_id: str) -> Optional[dict]:
-    p = _job_path(job_id); 
+    p = _job_path(job_id)
     if not os.path.exists(p): return None
     with open(p, "r", encoding="utf-8") as f: return json.load(f)
 def _pulse(job_id: str, **fields):
@@ -79,12 +79,11 @@ def _monthly_quarterly(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
     q = df.set_index("DATE")["VALUE"].resample("QS").mean()
     return m, q
 
+# ---------- Walk-forward models ----------
 def _walk_forward_ses(job_id: str, label: str, series: pd.Series, base_percent: int, span_percent: int) -> pd.Series:
     from statsmodels.tsa.holtwinters import SimpleExpSmoothing
     preds, idx = {}, series.index
     n = max(len(series) - 1, 1)
-
-    # in-sample
     for i in range(1, len(series)):
         hist = series.iloc[:i]
         try:
@@ -96,8 +95,6 @@ def _walk_forward_ses(job_id: str, label: str, series: pd.Series, base_percent: 
         preds[idx[i]] = pred
         pct = base_percent + int((i / n) * span_percent)
         _pulse(job_id, state="running", message=f"{label} {i}/{n}", percent=pct, done=0, total=1)
-
-    # one extra step
     if len(series) >= 1:
         hist = series
         try:
@@ -106,29 +103,55 @@ def _walk_forward_ses(job_id: str, label: str, series: pd.Series, base_percent: 
         except Exception:
             span = max(2, min(12, max(2, len(hist)//2)))
             pred = float(hist.ewm(span=span, adjust=False).mean().iloc[-1])
-
         last_ts = idx[-1]
         next_ts = (last_ts + (pd.offsets.MonthBegin(1) if idx.freqstr == "MS" else pd.offsets.QuarterBegin(1))).normalize()
         preds[next_ts] = pred
+    return pd.Series(preds, name="ses").sort_index()
 
-    return pd.Series(preds, name="pred").sort_index()
+def _walk_forward_hwes(job_id: str, label: str, series: pd.Series, base_percent: int, span_percent: int) -> pd.Series:
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+    preds, idx = {}, series.index
+    n = max(len(series) - 1, 1)
+    for i in range(1, len(series)):
+        hist = series.iloc[:i]
+        try:
+            # Holt-Winters: additive trend, no seasonality (fits monthly or quarterly)
+            fit = ExponentialSmoothing(hist, trend="add", seasonal=None, initialization_method="estimated").fit(optimized=True)
+            pred = float(fit.forecast(1)[0])
+        except Exception:
+            # fallback to SES if HWES fails
+            pred = float(hist.ewm(span=max(2, min(12, max(2, len(hist)//2))), adjust=False).mean().iloc[-1])
+        preds[idx[i]] = pred
+        pct = base_percent + int((i / n) * span_percent)
+        _pulse(job_id, state="running", message=f"{label} {i}/{n}", percent=pct, done=0, total=1)
+    if len(series) >= 1:
+        hist = series
+        try:
+            fit = ExponentialSmoothing(hist, trend="add", seasonal=None, initialization_method="estimated").fit(optimized=True)
+            pred = float(fit.forecast(1)[0])
+        except Exception:
+            pred = float(hist.ewm(span=max(2, min(12, max(2, len(hist)//2))), adjust=False).mean().iloc[-1])
+        last_ts = idx[-1]
+        next_ts = (last_ts + (pd.offsets.MonthBegin(1) if idx.freqstr == "MS" else pd.offsets.QuarterBegin(1))).normalize()
+        preds[next_ts] = pred
+    return pd.Series(preds, name="hwes").sort_index()
 
-def _gen_ses_only(job_id: str, df: pd.DataFrame) -> pd.DataFrame:
-    _pulse(job_id, state="running", message="Resampling to monthly/quarterly…", percent=20, done=0, total=1)
+# ---------- Build output ----------
+def _gen_ses_hwes(job_id: str, df: pd.DataFrame) -> pd.DataFrame:
+    _pulse(job_id, state="running", message="Resampling to monthly/quarterly…", percent=15, done=0, total=1)
     m, q = _monthly_quarterly(df)
 
-    ses_m = _walk_forward_ses(job_id, "SES-M", m, base_percent=20, span_percent=40)   # 20→60
-    ses_q = _walk_forward_ses(job_id, "SES-Q", q, base_percent=60, span_percent=38)   # 60→98
+    # Progress allocation across four tracks
+    ses_m = _walk_forward_ses(job_id,  "SES-M",  m, base_percent=15, span_percent=20)  # 15→35
+    ses_q = _walk_forward_ses(job_id,  "SES-Q",  q, base_percent=35, span_percent=20)  # 35→55
+    hwes_m= _walk_forward_hwes(job_id, "HWES-M", m, base_percent=55, span_percent=20)  # 55→75
+    hwes_q= _walk_forward_hwes(job_id, "HWES-Q", q, base_percent=75, span_percent=22)  # 75→97
 
     hist_start = pd.to_datetime(df["DATE"].min()).normalize()
     hist_end   = pd.to_datetime(df["DATE"].max()).normalize()
+    out_end_cap = (hist_end + pd.offsets.QuarterEnd(1)).normalize()  # upper bound; we will trim to coverage
 
-    # Provisional end: end of next quarter beyond history (upper bound)
-    out_end_cap = (hist_end + pd.offsets.QuarterEnd(1)).normalize()
-
-    # Safe filler
     def fill_days(series_pred: pd.Series, freq: str, span_end: pd.Timestamp) -> pd.Series:
-        # Create a broad index up to the cap, then trim later
         idx_all = pd.date_range(hist_start, span_end, freq="D")
         out = pd.Series(index=idx_all, dtype="float64")
         for ts, val in series_pred.items():
@@ -138,24 +161,26 @@ def _gen_ses_only(job_id: str, df: pd.DataFrame) -> pd.DataFrame:
             out.loc[rng] = float(val)
         return out
 
-    m_fill = fill_days(ses_m, "MS", out_end_cap)
-    q_fill = fill_days(ses_q, "QS", out_end_cap)
+    m_fill_ses  = fill_days(ses_m,  "MS", out_end_cap)
+    q_fill_ses  = fill_days(ses_q,  "QS", out_end_cap)
+    m_fill_hwes = fill_days(hwes_m, "MS", out_end_cap)
+    q_fill_hwes = fill_days(hwes_q, "QS", out_end_cap)
 
-    # NEW: trim tail to the last day where either monthly OR quarterly forecast exists
-    last_m = m_fill.last_valid_index()
-    last_q = q_fill.last_valid_index()
-    coverage_end = max([d for d in [last_m, last_q] if d is not None], default=hist_end)
+    # Trim to the last day where ANY forecast exists
+    last_dates = [s.last_valid_index() for s in [m_fill_ses, q_fill_ses, m_fill_hwes, q_fill_hwes] if s is not None]
+    coverage_end = max([d for d in last_dates if d is not None], default=hist_end)
 
     all_dates = pd.date_range(hist_start, coverage_end, freq="D")
     out = pd.DataFrame({"DATE": all_dates})
-    # VALUE only within history
     value_map = df.set_index("DATE")["VALUE"]
-    out["VALUE"] = value_map.reindex(all_dates).values
+    out["VALUE"] = value_map.reindex(all_dates).values  # NaN beyond hist_end
 
-    # Align fills to trimmed range
-    out["SES-M"] = m_fill.reindex(all_dates).values
-    out["SES-Q"] = q_fill.reindex(all_dates).values
+    out["SES-M"]  = m_fill_ses.reindex(all_dates).values
+    out["SES-Q"]  = q_fill_ses.reindex(all_dates).values
+    out["HWES-M"] = m_fill_hwes.reindex(all_dates).values
+    out["HWES-Q"] = q_fill_hwes.reindex(all_dates).values
 
+    _pulse(job_id, state="running", message="Composing output CSV…", percent=98, done=0, total=1)
     return out
 
 # ---------- Params ----------
@@ -169,7 +194,7 @@ def _spawn_runner(job_id: str, params: dict):
             _pulse(job_id, state="running", message="Loading data…", percent=10, done=0, total=1)
             df = _load_series(params["db"], params["target_value"], params.get("state"), params.get("county_name"),
                               params.get("city_name"), params.get("cbsa_name"), params.get("agg","mean"), params.get("ftype","F"))
-            out = _gen_ses_only(job_id, df)
+            out = _gen_ses_hwes(job_id, df)
             fname = _compose_instance_name(params["target_value"], params.get("state"), params.get("county_name"),
                                            params.get("city_name"), params.get("cbsa_name"), params.get("ftype","F")) + ".csv"
             out_path = os.path.join(_OUTPUT_DIR, fname)
