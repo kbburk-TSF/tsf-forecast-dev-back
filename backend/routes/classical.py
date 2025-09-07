@@ -44,19 +44,32 @@ def _compose_instance_name(target_value: str, state: Optional[str] = "", county_
     parts = [_clean(target_value), _clean(state), _clean(county_name), _clean(city_name), _clean(cbsa_name), _clean(ftype or "F")]
     parts = [p for p in parts if p]; return "_".join(parts)
 
-def _load_series(db: str, target_value: str, state: Optional[str], county_name: Optional[str],
-                 city_name: Optional[str], cbsa_name: Optional[str], agg: str, ftype: str) -> pd.DataFrame:
+def _resolve_input_path(target_value: str, state: Optional[str], county_name: Optional[str],
+                        city_name: Optional[str], cbsa_name: Optional[str], ftype: str) -> Optional[str]:
     inst = _compose_instance_name(target_value, state, county_name, city_name, cbsa_name, ftype)
     candidate = os.path.join(_INPUT_DIR, f"F_{inst}.csv")
-    if os.path.exists(candidate): df = pd.read_csv(candidate)
-    else:
-        generic = os.path.join(_INPUT_DIR, "target.csv")
-        if os.path.exists(generic): df = pd.read_csv(generic)
-        else:
-            dates = pd.date_range("2024-01-01", "2025-07-31", freq="D")
-            vals = (np.sin(np.arange(len(dates)) / 17.0) * 12 + 60 + np.random.randn(len(dates)) * 2).round(3)
-            df = pd.DataFrame({"DATE": dates, "VALUE": vals})
+    if os.path.exists(candidate): return candidate
+    generic = os.path.join(_INPUT_DIR, "target.csv")
+    if os.path.exists(generic): return generic
+    return None
 
+def _load_series(db: str, target_value: str, state: Optional[str], county_name: Optional[str],
+                 city_name: Optional[str], cbsa_name: Optional[str], agg: str, ftype: str) -> pd.DataFrame:
+    """
+    STRICT loader: no synthetic fallback. If input is missing, raise.
+    Returns two-column DataFrame: DATE (datetime64[ns]), VALUE (float).
+    """
+    src_path = _resolve_input_path(target_value, state, county_name, city_name, cbsa_name, ftype)
+    if not src_path:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Input data not found. Looked for F_[{_compose_instance_name(target_value, state, county_name, city_name, cbsa_name, ftype)}].csv "
+                   f"and target.csv under {_INPUT_DIR}."
+        )
+
+    df = pd.read_csv(src_path)
+
+    # Normalize -> DATE, VALUE (keep full extent)
     cols = {c.lower().strip(): c for c in df.columns}
     if "date" in cols and "value" in cols:
         df = df[[cols["date"], cols["value"]]].copy(); df.columns = ["DATE","VALUE"]
@@ -68,11 +81,13 @@ def _load_series(db: str, target_value: str, state: Optional[str], county_name: 
         up = [c.upper().replace(" ", "_") for c in df.columns]; df.columns = up
         dcol = next((c for c in up if "DATE" in c), None)
         vcol = next((c for c in up if c in ("VALUE","VALUES","ARITHMETIC_MEAN","MEAN")), None)
-        if not (dcol and vcol): raise ValueError("Could not identify DATE/VALUE columns.")
+        if not (dcol and vcol):
+            raise HTTPException(status_code=422, detail="Could not identify DATE/VALUE columns in input CSV.")
         df = df[[dcol, vcol]].copy(); df.columns = ["DATE","VALUE"]
 
-    df["DATE"] = pd.to_datetime(df["DATE"])
-    return df.sort_values("DATE").dropna(subset=["VALUE"])
+    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    df = df.dropna(subset=["DATE"]).sort_values("DATE")
+    return df
 
 def _monthly_quarterly(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
     m = df.set_index("DATE")["VALUE"].resample("MS").mean()
@@ -135,14 +150,12 @@ def _walk_forward_hwes(job_id: str, label: str, series: pd.Series, base_percent:
     return pd.Series(preds, name="hwes").sort_index()
 
 def _walk_forward_arima(job_id: str, label: str, series: pd.Series, base_percent: int, span_percent: int) -> pd.Series:
-    # Conservative ARIMA with robust fallbacks
     from statsmodels.tsa.arima.model import ARIMA
     preds, idx = {}, series.index
     n = max(len(series) - 1, 1)
 
     def _fit_forecast(hist: pd.Series) -> float:
         try:
-            # Prefer (1,1,0); fall back to (1,0,0)
             for order in [(1,1,0), (1,0,0)]:
                 try:
                     fit = ARIMA(hist, order=order, enforce_stationarity=False, enforce_invertibility=False).fit(method_kwargs={"warn_convergence": False})
@@ -151,7 +164,6 @@ def _walk_forward_arima(job_id: str, label: str, series: pd.Series, base_percent
                     continue
         except Exception:
             pass
-        # Last-resort: SES-style EWM
         span = max(2, min(12, max(2, len(hist)//2)))
         return float(hist.ewm(span=span, adjust=False).mean().iloc[-1])
 
@@ -176,7 +188,7 @@ def _gen_all(job_id: str, df: pd.DataFrame) -> pd.DataFrame:
     _pulse(job_id, state="running", message="Resampling to monthly/quarterly…", percent=12, done=0, total=1)
     m, q = _monthly_quarterly(df)
 
-    # Progress allocation across six tracks: SES-M/Q, HWES-M/Q, ARIMA-M/Q
+    # Progress allocation across six tracks
     ses_m   = _walk_forward_ses(  job_id, "SES-M",   m, base_percent=12, span_percent=14)  # 12→26
     ses_q   = _walk_forward_ses(  job_id, "SES-Q",   q, base_percent=26, span_percent=14)  # 26→40
     hwes_m  = _walk_forward_hwes( job_id, "HWES-M",  m, base_percent=40, span_percent=14)  # 40→54
@@ -211,9 +223,12 @@ def _gen_all(job_id: str, df: pd.DataFrame) -> pd.DataFrame:
 
     all_dates = pd.date_range(hist_start, coverage_end, freq="D")
     out = pd.DataFrame({"DATE": all_dates})
-    value_map = df.set_index("DATE")["VALUE"]
-    out["VALUE"] = value_map.reindex(all_dates).values  # NaN beyond hist_end
 
+    # VALUE only within history; NaN beyond hist_end
+    value_map = df.set_index("DATE")["VALUE"]
+    out["VALUE"] = value_map.reindex(all_dates).values
+
+    # Forecast columns
     out["SES-M"]   = m_fill_ses.reindex(all_dates).values
     out["SES-Q"]   = q_fill_ses.reindex(all_dates).values
     out["HWES-M"]  = m_fill_hwes.reindex(all_dates).values
@@ -258,10 +273,22 @@ def classical_probe(
     agg: str = "mean",
     ftype: str = "F",
 ):
-    _state = _coalesce_state(state, state_name)
-    df = _load_series(db, target_value, _state, county_name, city_name, cbsa_name, agg, ftype)
-    return {"rows": int(len(df)), "start_date": df["DATE"].min().strftime("%Y-%m-%d"),
-            "end_date": df["DATE"].max().strftime("%Y-%m-%d")}
+    _state = (state or state_name or "").strip()
+    src_path = _resolve_input_path(target_value, _state, county_name, city_name, cbsa_name, ftype)
+    if not src_path:
+        raise HTTPException(status_code=404, detail=f"No input CSV found under {_INPUT_DIR}")
+    df = pd.read_csv(src_path)
+    # find a date-like column for quick probe
+    date_col = next((c for c in df.columns if c.lower().strip() in ("date","date local")), None)
+    if date_col is None:
+        date_col = next((c for c in df.columns if "date" in c.lower()), None)
+    dates = pd.to_datetime(df[date_col], errors="coerce")
+    return {
+        "rows": int(len(df)),
+        "source_path": src_path,
+        "start_date_raw": str(pd.to_datetime(dates.min())) if len(df) else None,
+        "end_date_raw": str(pd.to_datetime(dates.max())) if len(df) else None,
+    }
 
 @router.post("/classical/start")
 async def classical_start(
