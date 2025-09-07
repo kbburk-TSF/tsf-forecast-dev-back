@@ -115,11 +115,9 @@ def _walk_forward_hwes(job_id: str, label: str, series: pd.Series, base_percent:
     for i in range(1, len(series)):
         hist = series.iloc[:i]
         try:
-            # Holt-Winters: additive trend, no seasonality (fits monthly or quarterly)
             fit = ExponentialSmoothing(hist, trend="add", seasonal=None, initialization_method="estimated").fit(optimized=True)
             pred = float(fit.forecast(1)[0])
         except Exception:
-            # fallback to SES if HWES fails
             pred = float(hist.ewm(span=max(2, min(12, max(2, len(hist)//2))), adjust=False).mean().iloc[-1])
         preds[idx[i]] = pred
         pct = base_percent + int((i / n) * span_percent)
@@ -136,16 +134,55 @@ def _walk_forward_hwes(job_id: str, label: str, series: pd.Series, base_percent:
         preds[next_ts] = pred
     return pd.Series(preds, name="hwes").sort_index()
 
+def _walk_forward_arima(job_id: str, label: str, series: pd.Series, base_percent: int, span_percent: int) -> pd.Series:
+    # Conservative ARIMA with robust fallbacks
+    from statsmodels.tsa.arima.model import ARIMA
+    preds, idx = {}, series.index
+    n = max(len(series) - 1, 1)
+
+    def _fit_forecast(hist: pd.Series) -> float:
+        try:
+            # Prefer (1,1,0); fall back to (1,0,0)
+            for order in [(1,1,0), (1,0,0)]:
+                try:
+                    fit = ARIMA(hist, order=order, enforce_stationarity=False, enforce_invertibility=False).fit(method_kwargs={"warn_convergence": False})
+                    return float(fit.forecast(1)[0])
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # Last-resort: SES-style EWM
+        span = max(2, min(12, max(2, len(hist)//2)))
+        return float(hist.ewm(span=span, adjust=False).mean().iloc[-1])
+
+    for i in range(1, len(series)):
+        hist = series.iloc[:i]
+        pred = _fit_forecast(hist)
+        preds[idx[i]] = pred
+        pct = base_percent + int((i / n) * span_percent)
+        _pulse(job_id, state="running", message=f"{label} {i}/{n}", percent=pct, done=0, total=1)
+
+    if len(series) >= 1:
+        hist = series
+        pred = _fit_forecast(hist)
+        last_ts = idx[-1]
+        next_ts = (last_ts + (pd.offsets.MonthBegin(1) if idx.freqstr == "MS" else pd.offsets.QuarterBegin(1))).normalize()
+        preds[next_ts] = pred
+
+    return pd.Series(preds, name="arima").sort_index()
+
 # ---------- Build output ----------
-def _gen_ses_hwes(job_id: str, df: pd.DataFrame) -> pd.DataFrame:
-    _pulse(job_id, state="running", message="Resampling to monthly/quarterly…", percent=15, done=0, total=1)
+def _gen_all(job_id: str, df: pd.DataFrame) -> pd.DataFrame:
+    _pulse(job_id, state="running", message="Resampling to monthly/quarterly…", percent=12, done=0, total=1)
     m, q = _monthly_quarterly(df)
 
-    # Progress allocation across four tracks
-    ses_m = _walk_forward_ses(job_id,  "SES-M",  m, base_percent=15, span_percent=20)  # 15→35
-    ses_q = _walk_forward_ses(job_id,  "SES-Q",  q, base_percent=35, span_percent=20)  # 35→55
-    hwes_m= _walk_forward_hwes(job_id, "HWES-M", m, base_percent=55, span_percent=20)  # 55→75
-    hwes_q= _walk_forward_hwes(job_id, "HWES-Q", q, base_percent=75, span_percent=22)  # 75→97
+    # Progress allocation across six tracks: SES-M/Q, HWES-M/Q, ARIMA-M/Q
+    ses_m   = _walk_forward_ses(  job_id, "SES-M",   m, base_percent=12, span_percent=14)  # 12→26
+    ses_q   = _walk_forward_ses(  job_id, "SES-Q",   q, base_percent=26, span_percent=14)  # 26→40
+    hwes_m  = _walk_forward_hwes( job_id, "HWES-M",  m, base_percent=40, span_percent=14)  # 40→54
+    hwes_q  = _walk_forward_hwes( job_id, "HWES-Q",  q, base_percent=54, span_percent=14)  # 54→68
+    arima_m = _walk_forward_arima(job_id, "ARIMA-M", m, base_percent=68, span_percent=14)  # 68→82
+    arima_q = _walk_forward_arima(job_id, "ARIMA-Q", q, base_percent=82, span_percent=15)  # 82→97
 
     hist_start = pd.to_datetime(df["DATE"].min()).normalize()
     hist_end   = pd.to_datetime(df["DATE"].max()).normalize()
@@ -161,13 +198,15 @@ def _gen_ses_hwes(job_id: str, df: pd.DataFrame) -> pd.DataFrame:
             out.loc[rng] = float(val)
         return out
 
-    m_fill_ses  = fill_days(ses_m,  "MS", out_end_cap)
-    q_fill_ses  = fill_days(ses_q,  "QS", out_end_cap)
-    m_fill_hwes = fill_days(hwes_m, "MS", out_end_cap)
-    q_fill_hwes = fill_days(hwes_q, "QS", out_end_cap)
+    m_fill_ses   = fill_days(ses_m,   "MS", out_end_cap)
+    q_fill_ses   = fill_days(ses_q,   "QS", out_end_cap)
+    m_fill_hwes  = fill_days(hwes_m,  "MS", out_end_cap)
+    q_fill_hwes  = fill_days(hwes_q,  "QS", out_end_cap)
+    m_fill_arima = fill_days(arima_m, "MS", out_end_cap)
+    q_fill_arima = fill_days(arima_q, "QS", out_end_cap)
 
     # Trim to the last day where ANY forecast exists
-    last_dates = [s.last_valid_index() for s in [m_fill_ses, q_fill_ses, m_fill_hwes, q_fill_hwes] if s is not None]
+    last_dates = [s.last_valid_index() for s in [m_fill_ses, q_fill_ses, m_fill_hwes, q_fill_hwes, m_fill_arima, q_fill_arima] if s is not None]
     coverage_end = max([d for d in last_dates if d is not None], default=hist_end)
 
     all_dates = pd.date_range(hist_start, coverage_end, freq="D")
@@ -175,10 +214,12 @@ def _gen_ses_hwes(job_id: str, df: pd.DataFrame) -> pd.DataFrame:
     value_map = df.set_index("DATE")["VALUE"]
     out["VALUE"] = value_map.reindex(all_dates).values  # NaN beyond hist_end
 
-    out["SES-M"]  = m_fill_ses.reindex(all_dates).values
-    out["SES-Q"]  = q_fill_ses.reindex(all_dates).values
-    out["HWES-M"] = m_fill_hwes.reindex(all_dates).values
-    out["HWES-Q"] = q_fill_hwes.reindex(all_dates).values
+    out["SES-M"]   = m_fill_ses.reindex(all_dates).values
+    out["SES-Q"]   = q_fill_ses.reindex(all_dates).values
+    out["HWES-M"]  = m_fill_hwes.reindex(all_dates).values
+    out["HWES-Q"]  = q_fill_hwes.reindex(all_dates).values
+    out["ARIMA-M"] = m_fill_arima.reindex(all_dates).values
+    out["ARIMA-Q"] = q_fill_arima.reindex(all_dates).values
 
     _pulse(job_id, state="running", message="Composing output CSV…", percent=98, done=0, total=1)
     return out
@@ -191,10 +232,10 @@ def _coalesce_state(state: Optional[str], state_name: Optional[str]) -> str:
 def _spawn_runner(job_id: str, params: dict):
     def _runner():
         try:
-            _pulse(job_id, state="running", message="Loading data…", percent=10, done=0, total=1)
+            _pulse(job_id, state="running", message="Loading data…", percent=8, done=0, total=1)
             df = _load_series(params["db"], params["target_value"], params.get("state"), params.get("county_name"),
                               params.get("city_name"), params.get("cbsa_name"), params.get("agg","mean"), params.get("ftype","F"))
-            out = _gen_ses_hwes(job_id, df)
+            out = _gen_all(job_id, df)
             fname = _compose_instance_name(params["target_value"], params.get("state"), params.get("county_name"),
                                            params.get("city_name"), params.get("cbsa_name"), params.get("ftype","F")) + ".csv"
             out_path = os.path.join(_OUTPUT_DIR, fname)
