@@ -21,60 +21,38 @@ JOBS_DIR = os.path.join(_OUTPUT_DIR, "_jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
 HEARTBEAT_SECS = 120  # mark paused after this; client can POST /resume
 
-def _job_path(job_id: str) -> str:
-    return os.path.join(JOBS_DIR, f"{job_id}.json")
-
+def _job_path(job_id: str) -> str: return os.path.join(JOBS_DIR, f"{job_id}.json")
 def _job_write(job_id: str, **data):
     data = dict(data); data["updated_at"] = time.time()
-    with open(_job_path(job_id), "w", encoding="utf-8") as f:
-        json.dump(data, f)
-
+    with open(_job_path(job_id), "w", encoding="utf-8") as f: json.dump(data, f)
 def _job_read(job_id: str) -> Optional[dict]:
-    p = _job_path(job_id)
+    p = _job_path(job_id); 
     if not os.path.exists(p): return None
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
-
+    with open(p, "r", encoding="utf-8") as f: return json.load(f)
 def _pulse(job_id: str, **fields):
-    job = _job_read(job_id) or {}
-    job.update(fields); _job_write(job_id, **job)
-
+    job = _job_read(job_id) or {}; job.update(fields); _job_write(job_id, **job)
 def _is_stale(job: dict) -> bool:
     return job.get("state") == "running" and (time.time() - float(job.get("updated_at",0))) > HEARTBEAT_SECS
 
 # ---------- Helpers ----------
 def _clean(x: Optional[str]) -> Optional[str]:
     if x is None: return None
-    s = str(x).strip()
-    return s.replace("/", "-").replace("\\", "-") if s else None
+    s = str(x).strip(); return s.replace("/", "-").replace("\\", "-") if s else None
 
-def _compose_instance_name(
-    target_value: str,
-    state: Optional[str] = "",
-    county_name: Optional[str] = "",
-    city_name: Optional[str] = "",
-    cbsa_name: Optional[str] = "",
-    ftype: str = "F",
-) -> str:
+def _compose_instance_name(target_value: str, state: Optional[str] = "", county_name: Optional[str] = "",
+                           city_name: Optional[str] = "", cbsa_name: Optional[str] = "", ftype: str = "F") -> str:
     parts = [_clean(target_value), _clean(state), _clean(county_name), _clean(city_name), _clean(cbsa_name), _clean(ftype or "F")]
-    parts = [p for p in parts if p]
-    return "_".join(parts)
+    parts = [p for p in parts if p]; return "_".join(parts)
 
 def _load_series(db: str, target_value: str, state: Optional[str], county_name: Optional[str],
                  city_name: Optional[str], cbsa_name: Optional[str], agg: str, ftype: str) -> pd.DataFrame:
-    """
-    Loads input to a normalized two-column DataFrame: DATE (datetime64[ns]), VALUE (float).
-    """
     inst = _compose_instance_name(target_value, state, county_name, city_name, cbsa_name, ftype)
     candidate = os.path.join(_INPUT_DIR, f"F_{inst}.csv")
-    if os.path.exists(candidate):
-        df = pd.read_csv(candidate)
+    if os.path.exists(candidate): df = pd.read_csv(candidate)
     else:
         generic = os.path.join(_INPUT_DIR, "target.csv")
-        if os.path.exists(generic):
-            df = pd.read_csv(generic)
+        if os.path.exists(generic): df = pd.read_csv(generic)
         else:
-            # Fallback demo shape: 2024-01-01 .. 2025-07-31
             dates = pd.date_range("2024-01-01", "2025-07-31", freq="D")
             vals = (np.sin(np.arange(len(dates)) / 17.0) * 12 + 60 + np.random.randn(len(dates)) * 2).round(3)
             df = pd.DataFrame({"DATE": dates, "VALUE": vals})
@@ -87,37 +65,26 @@ def _load_series(db: str, target_value: str, state: Optional[str], county_name: 
         tmp.columns = ["DATE","VALUE"]; tmp["DATE"] = pd.to_datetime(tmp["DATE"])
         df = tmp.groupby("DATE", as_index=False)["VALUE"].mean()
     else:
-        up = [c.upper().replace(" ", "_") for c in df.columns]
-        df.columns = up
+        up = [c.upper().replace(" ", "_") for c in df.columns]; df.columns = up
         dcol = next((c for c in up if "DATE" in c), None)
         vcol = next((c for c in up if c in ("VALUE","VALUES","ARITHMETIC_MEAN","MEAN")), None)
         if not (dcol and vcol): raise ValueError("Could not identify DATE/VALUE columns.")
         df = df[[dcol, vcol]].copy(); df.columns = ["DATE","VALUE"]
 
     df["DATE"] = pd.to_datetime(df["DATE"])
-    df = df.sort_values("DATE").dropna(subset=["VALUE"])
-    return df
+    return df.sort_values("DATE").dropna(subset=["VALUE"])
 
 def _monthly_quarterly(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
-    """
-    Returns monthly (MS) and quarterly (QS) series from the historical VALUEs.
-    """
     m = df.set_index("DATE")["VALUE"].resample("MS").mean()
     q = df.set_index("DATE")["VALUE"].resample("QS").mean()
     return m, q
 
 def _walk_forward_ses(job_id: str, label: str, series: pd.Series, base_percent: int, span_percent: int) -> pd.Series:
-    """
-    Simple Exponential Smoothing walk-forward:
-    - Produces one-step-ahead predictions for each step within the historical index (i=1..len-1).
-    - Also appends ONE additional prediction beyond the last timestamp (for next MS/QS).
-    """
     from statsmodels.tsa.holtwinters import SimpleExpSmoothing
-    preds = {}
-    idx = series.index
+    preds, idx = {}, series.index
     n = max(len(series) - 1, 1)
 
-    # in-sample walk-forward
+    # in-sample
     for i in range(1, len(series)):
         hist = series.iloc[:i]
         try:
@@ -130,7 +97,7 @@ def _walk_forward_ses(job_id: str, label: str, series: pd.Series, base_percent: 
         pct = base_percent + int((i / n) * span_percent)
         _pulse(job_id, state="running", message=f"{label} {i}/{n}", percent=pct, done=0, total=1)
 
-    # one extra step beyond history
+    # one extra step
     if len(series) >= 1:
         hist = series
         try:
@@ -141,62 +108,55 @@ def _walk_forward_ses(job_id: str, label: str, series: pd.Series, base_percent: 
             pred = float(hist.ewm(span=span, adjust=False).mean().iloc[-1])
 
         last_ts = idx[-1]
-        if idx.freqstr == "MS":
-            next_ts = (last_ts + pd.offsets.MonthBegin(1)).normalize()
-        else:  # "QS"
-            next_ts = (last_ts + pd.offsets.QuarterBegin(1)).normalize()
+        next_ts = (last_ts + (pd.offsets.MonthBegin(1) if idx.freqstr == "MS" else pd.offsets.QuarterBegin(1))).normalize()
         preds[next_ts] = pred
 
     return pd.Series(preds, name="pred").sort_index()
 
 def _gen_ses_only(job_id: str, df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Builds output with:
-      - DATE (daily), VALUE (historical only),
-      - SES-M (filled per day to month-end),
-      - SES-Q (filled per day to quarter-end).
-    Output DATEs extend to the END OF NEXT QUARTER beyond the last historical day.
-    """
     _pulse(job_id, state="running", message="Resampling to monthly/quarterly…", percent=20, done=0, total=1)
     m, q = _monthly_quarterly(df)
 
     ses_m = _walk_forward_ses(job_id, "SES-M", m, base_percent=20, span_percent=40)   # 20→60
     ses_q = _walk_forward_ses(job_id, "SES-Q", q, base_percent=60, span_percent=38)   # 60→98
 
-    # Establish output DATE range:
     hist_start = pd.to_datetime(df["DATE"].min()).normalize()
     hist_end   = pd.to_datetime(df["DATE"].max()).normalize()
-    # extend to end of next quarter beyond history
-    hist_q_end = (hist_end + pd.offsets.QuarterEnd(0)).normalize()
-    out_end    = (hist_q_end + pd.offsets.QuarterEnd(1)).normalize()
 
-    all_dates = pd.date_range(hist_start, out_end, freq="D")
+    # Provisional end: end of next quarter beyond history (upper bound)
+    out_end_cap = (hist_end + pd.offsets.QuarterEnd(1)).normalize()
 
-    d = pd.DataFrame({"DATE": all_dates})
-    # VALUE only for dates within history
-    value_map = df.set_index("DATE")["VALUE"]
-    d["VALUE"] = value_map.reindex(all_dates).values  # will be NaN beyond hist_end
-
-    def fill_days(series_pred: pd.Series, freq: str, all_idx: pd.DatetimeIndex) -> pd.Series:
-        """
-        Safe filler that DOES NOT assume dates already exist in index.
-        For each monthly/quarterly stamp ts, writes its forecast value to every day
-        from ts (inclusive) to the period end (inclusive).
-        """
-        out = pd.Series(index=all_idx, dtype="float64")
+    # Safe filler
+    def fill_days(series_pred: pd.Series, freq: str, span_end: pd.Timestamp) -> pd.Series:
+        # Create a broad index up to the cap, then trim later
+        idx_all = pd.date_range(hist_start, span_end, freq="D")
+        out = pd.Series(index=idx_all, dtype="float64")
         for ts, val in series_pred.items():
             end = (ts + (pd.offsets.MonthEnd(0) if freq == "MS" else pd.offsets.QuarterEnd(0))).normalize()
-            if end > all_idx[-1]:
-                end = all_idx[-1]
+            if end > span_end: end = span_end
             rng = pd.date_range(ts, end, freq="D")
             out.loc[rng] = float(val)
         return out
 
-    _pulse(job_id, state="running", message="Composing output CSV…", percent=98, done=0, total=1)
-    d["SES-M"] = fill_days(ses_m, "MS", all_dates).values
-    d["SES-Q"] = fill_days(ses_q, "QS", all_dates).values
+    m_fill = fill_days(ses_m, "MS", out_end_cap)
+    q_fill = fill_days(ses_q, "QS", out_end_cap)
 
-    return d  # no ffill of VALUE beyond hist_end; forecasts are present past history
+    # NEW: trim tail to the last day where either monthly OR quarterly forecast exists
+    last_m = m_fill.last_valid_index()
+    last_q = q_fill.last_valid_index()
+    coverage_end = max([d for d in [last_m, last_q] if d is not None], default=hist_end)
+
+    all_dates = pd.date_range(hist_start, coverage_end, freq="D")
+    out = pd.DataFrame({"DATE": all_dates})
+    # VALUE only within history
+    value_map = df.set_index("DATE")["VALUE"]
+    out["VALUE"] = value_map.reindex(all_dates).values
+
+    # Align fills to trimmed range
+    out["SES-M"] = m_fill.reindex(all_dates).values
+    out["SES-Q"] = q_fill.reindex(all_dates).values
+
+    return out
 
 # ---------- Params ----------
 def _coalesce_state(state: Optional[str], state_name: Optional[str]) -> str:
@@ -207,15 +167,11 @@ def _spawn_runner(job_id: str, params: dict):
     def _runner():
         try:
             _pulse(job_id, state="running", message="Loading data…", percent=10, done=0, total=1)
-            df = _load_series(
-                params["db"], params["target_value"], params.get("state"), params.get("county_name"),
-                params.get("city_name"), params.get("cbsa_name"), params.get("agg","mean"), params.get("ftype","F")
-            )
+            df = _load_series(params["db"], params["target_value"], params.get("state"), params.get("county_name"),
+                              params.get("city_name"), params.get("cbsa_name"), params.get("agg","mean"), params.get("ftype","F"))
             out = _gen_ses_only(job_id, df)
-            fname = _compose_instance_name(
-                params["target_value"], params.get("state"), params.get("county_name"),
-                params.get("city_name"), params.get("cbsa_name"), params.get("ftype","F")
-            ) + ".csv"
+            fname = _compose_instance_name(params["target_value"], params.get("state"), params.get("county_name"),
+                                           params.get("city_name"), params.get("cbsa_name"), params.get("ftype","F")) + ".csv"
             out_path = os.path.join(_OUTPUT_DIR, fname)
             out.to_csv(out_path, index=False)
             _pulse(job_id, state="ready", message="Completed", percent=100, done=1, total=1, output_file=out_path)
@@ -238,11 +194,8 @@ def classical_probe(
 ):
     _state = _coalesce_state(state, state_name)
     df = _load_series(db, target_value, _state, county_name, city_name, cbsa_name, agg, ftype)
-    return {
-        "rows": int(len(df)),
-        "start_date": df["DATE"].min().strftime("%Y-%m-%d"),
-        "end_date": df["DATE"].max().strftime("%Y-%m-%d"),
-    }
+    return {"rows": int(len(df)), "start_date": df["DATE"].min().strftime("%Y-%m-%d"),
+            "end_date": df["DATE"].max().strftime("%Y-%m-%d")}
 
 @router.post("/classical/start")
 async def classical_start(
@@ -279,8 +232,7 @@ async def classical_start(
     _agg    = pick("agg", default="mean")             if agg is None          else agg
     _ftype  = pick("ftype", default="F")              if ftype is None        else ftype
 
-    if not _target:
-        raise HTTPException(status_code=422, detail="target_value is required")
+    if not _target: raise HTTPException(status_code=422, detail="target_value is required")
 
     job_id = str(uuid.uuid4())
     _job_write(job_id, state="queued", message="Queued", percent=0, done=0, total=1,
