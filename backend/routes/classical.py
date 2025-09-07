@@ -36,17 +36,43 @@ def _pulse(job_id: str, **fields):
 def _is_stale(job: dict) -> bool:
     return job.get("state") == "running" and (time.time() - float(job.get("updated_at",0))) > HEARTBEAT_SECS
 
+# ---------- Helpers ----------
+def _clean(x: Optional[str]) -> Optional[str]:
+    if x is None: return None
+    s = str(x).strip()
+    return s if s else None
+
+def _compose_instance_name(
+    target_value: str,
+    state: Optional[str] = "",
+    county_name: Optional[str] = "",
+    city_name: Optional[str] = "",
+    cbsa_name: Optional[str] = "",
+    ftype: str = "F"
+) -> str:
+    """Builds a safe filename from the input parameters."""
+    parts = []
+    for p in [target_value, state, county_name, city_name, cbsa_name, ftype or "F"]:
+        if p:
+            safe = str(p).strip().replace("/", "-").replace("\\", "-").replace(" ", "_")
+            parts.append(safe)
+    return "_".join(parts)
+
+def _monthly_quarterly(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    m = df.set_index("DATE")["VALUE"].resample("MS").mean()
+    q = df.set_index("DATE")["VALUE"].resample("QS").mean()
+    return m, q
+
 # ---------- DB Helpers ----------
 def _get_conn():
-    """
-    Uses standard Postgres connection string from env:
-      DATABASE_URL (preferred, full URL)  OR
-      NEON_HOST / NEON_DB / NEON_USER / NEON_PASSWORD / NEON_PORT
-    Render & Neon both expose DATABASE_URL commonly.
-    """
+    import re
     dsn = os.getenv("DATABASE_URL")
     if dsn:
-        return psycopg2.connect(dsn, cursor_factory=RealDictCursor, sslmode="require")
+        # Normalize SQLAlchemy-style schemes to plain Postgres for psycopg2
+        dsn = re.sub(r"^(postgresql?|postgres)\+psycopg2?://", r"\1://", dsn, flags=re.I)
+        if "sslmode=" not in dsn:
+            dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
+        return psycopg2.connect(dsn, cursor_factory=RealDictCursor)
     host = os.getenv("NEON_HOST")
     db   = os.getenv("NEON_DB")
     user = os.getenv("NEON_USER")
@@ -59,18 +85,7 @@ def _get_conn():
         cursor_factory=RealDictCursor, sslmode="require"
     )
 
-# You can override the table fully via env if needed (schema.table or just table)
 DEFAULT_TABLE = os.getenv("TSF_TABLE", 'demo_air_quality.air_quality_raw')
-
-def _clean(x: Optional[str]) -> Optional[str]:
-    if x is None: return None
-    s = str(x).strip()
-    return s if s else None
-
-def _monthly_quarterly(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
-    m = df.set_index("DATE")["VALUE"].resample("MS").mean()
-    q = df.set_index("DATE")["VALUE"].resample("QS").mean()
-    return m, q
 
 # ---------- Load series from Neon ----------
 def _load_series_from_neon(
@@ -83,15 +98,7 @@ def _load_series_from_neon(
     agg: str,
     ftype: str,
 ) -> pd.DataFrame:
-    """
-    Pulls live rows from Neon and returns DATE, VALUE (daily).
-    Maps:
-      - target_value -> "Parameter Name"
-      - state/county/city/cbsa -> filter columns
-      - agg: currently 'mean' supported (daily mean)
-    """
-    table = DEFAULT_TABLE  # using env/configurable table
-
+    table = DEFAULT_TABLE
     q = f"""
         SELECT
             DATE("Date Local") AS date,
@@ -105,7 +112,6 @@ def _load_series_from_neon(
         GROUP BY DATE("Date Local")
         ORDER BY DATE("Date Local")
     """
-
     params = [
         _clean(target_value),
         _clean(state), _clean(state),
@@ -113,25 +119,21 @@ def _load_series_from_neon(
         _clean(city_name), _clean(city_name),
         _clean(cbsa_name), _clean(cbsa_name),
     ]
-
     try:
         with _get_conn() as conn, conn.cursor() as cur:
             cur.execute(q, params)
             rows = cur.fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Neon query failed: {str(e)}")
-
     if not rows:
-        # Explicit error so you see why output would be empty
         raise HTTPException(status_code=404, detail="No matching rows in Neon for the given filters.")
-
     df = pd.DataFrame(rows)
     df.rename(columns={"date":"DATE", "value":"VALUE"}, inplace=True)
     df["DATE"] = pd.to_datetime(df["DATE"])
     df = df.sort_values("DATE")
     return df
 
-# ---------- Walk-forward models ----------
+# ---------- Forecast models ----------
 def _walk_forward_ses(job_id: str, label: str, series: pd.Series, base_percent: int, span_percent: int) -> pd.Series:
     from statsmodels.tsa.holtwinters import SimpleExpSmoothing
     preds, idx = {}, series.index
@@ -298,7 +300,7 @@ def _spawn_runner(job_id: str, params: dict):
             _pulse(job_id, state="error", message=str(e), percent=0, done=0, total=1)
     threading.Thread(target=_runner, daemon=True).start()
 
-# ---------- API ----------
+# ---------- API endpoints ----------
 @router.get("/classical/probe")
 def classical_probe(
     db: str,
