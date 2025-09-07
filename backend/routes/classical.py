@@ -5,15 +5,17 @@ import os, uuid, threading, time, json
 import pandas as pd
 import numpy as np
 
+# DB
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
 router = APIRouter()
 
 # ---------- Paths ----------
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_BASE_DIR, ".."))          # backend/
 _DATA_DIR = os.path.join(_ROOT, "data")
-_INPUT_DIR = os.path.join(_DATA_DIR, "input")
 _OUTPUT_DIR = os.path.join(_DATA_DIR, "output")
-os.makedirs(_INPUT_DIR, exist_ok=True)
 os.makedirs(_OUTPUT_DIR, exist_ok=True)
 
 # ---------- Durable job store ----------
@@ -34,65 +36,100 @@ def _pulse(job_id: str, **fields):
 def _is_stale(job: dict) -> bool:
     return job.get("state") == "running" and (time.time() - float(job.get("updated_at",0))) > HEARTBEAT_SECS
 
-# ---------- Helpers ----------
+# ---------- DB Helpers ----------
+def _get_conn():
+    """
+    Uses standard Postgres connection string from env:
+      DATABASE_URL (preferred, full URL)  OR
+      NEON_HOST / NEON_DB / NEON_USER / NEON_PASSWORD / NEON_PORT
+    Render & Neon both expose DATABASE_URL commonly.
+    """
+    dsn = os.getenv("DATABASE_URL")
+    if dsn:
+        return psycopg2.connect(dsn, cursor_factory=RealDictCursor, sslmode="require")
+    host = os.getenv("NEON_HOST")
+    db   = os.getenv("NEON_DB")
+    user = os.getenv("NEON_USER")
+    pwd  = os.getenv("NEON_PASSWORD")
+    port = os.getenv("NEON_PORT", "5432")
+    if not all([host, db, user, pwd]):
+        raise HTTPException(status_code=500, detail="Neon connection env vars not set (DATABASE_URL or NEON_*).")
+    return psycopg2.connect(
+        host=host, dbname=db, user=user, password=pwd, port=port,
+        cursor_factory=RealDictCursor, sslmode="require"
+    )
+
+# You can override the table fully via env if needed (schema.table or just table)
+DEFAULT_TABLE = os.getenv("TSF_TABLE", 'demo_air_quality.air_quality_raw')
+
 def _clean(x: Optional[str]) -> Optional[str]:
     if x is None: return None
-    s = str(x).strip(); return s.replace("/", "-").replace("\\", "-") if s else None
-
-def _compose_instance_name(target_value: str, state: Optional[str] = "", county_name: Optional[str] = "",
-                           city_name: Optional[str] = "", cbsa_name: Optional[str] = "", ftype: str = "F") -> str:
-    parts = [_clean(target_value), _clean(state), _clean(county_name), _clean(city_name), _clean(cbsa_name), _clean(ftype or "F")]
-    parts = [p for p in parts if p]; return "_".join(parts)
-
-def _resolve_input_path(target_value: str, state: Optional[str], county_name: Optional[str],
-                        city_name: Optional[str], cbsa_name: Optional[str], ftype: str) -> Optional[str]:
-    inst = _compose_instance_name(target_value, state, county_name, city_name, cbsa_name, ftype)
-    candidate = os.path.join(_INPUT_DIR, f"F_{inst}.csv")
-    if os.path.exists(candidate): return candidate
-    generic = os.path.join(_INPUT_DIR, "target.csv")
-    if os.path.exists(generic): return generic
-    return None
-
-def _load_series(db: str, target_value: str, state: Optional[str], county_name: Optional[str],
-                 city_name: Optional[str], cbsa_name: Optional[str], agg: str, ftype: str) -> pd.DataFrame:
-    """
-    STRICT loader: no synthetic fallback. If input is missing, raise.
-    Returns two-column DataFrame: DATE (datetime64[ns]), VALUE (float).
-    """
-    src_path = _resolve_input_path(target_value, state, county_name, city_name, cbsa_name, ftype)
-    if not src_path:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Input data not found. Looked for F_[{_compose_instance_name(target_value, state, county_name, city_name, cbsa_name, ftype)}].csv "
-                   f"and target.csv under {_INPUT_DIR}."
-        )
-
-    df = pd.read_csv(src_path)
-
-    # Normalize -> DATE, VALUE (keep full extent)
-    cols = {c.lower().strip(): c for c in df.columns}
-    if "date" in cols and "value" in cols:
-        df = df[[cols["date"], cols["value"]]].copy(); df.columns = ["DATE","VALUE"]
-    elif "date local" in cols and "arithmetic mean" in cols:
-        tmp = df[[cols["date local"], cols["arithmetic mean"]]].copy()
-        tmp.columns = ["DATE","VALUE"]; tmp["DATE"] = pd.to_datetime(tmp["DATE"])
-        df = tmp.groupby("DATE", as_index=False)["VALUE"].mean()
-    else:
-        up = [c.upper().replace(" ", "_") for c in df.columns]; df.columns = up
-        dcol = next((c for c in up if "DATE" in c), None)
-        vcol = next((c for c in up if c in ("VALUE","VALUES","ARITHMETIC_MEAN","MEAN")), None)
-        if not (dcol and vcol):
-            raise HTTPException(status_code=422, detail="Could not identify DATE/VALUE columns in input CSV.")
-        df = df[[dcol, vcol]].copy(); df.columns = ["DATE","VALUE"]
-
-    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
-    df = df.dropna(subset=["DATE"]).sort_values("DATE")
-    return df
+    s = str(x).strip()
+    return s if s else None
 
 def _monthly_quarterly(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
     m = df.set_index("DATE")["VALUE"].resample("MS").mean()
     q = df.set_index("DATE")["VALUE"].resample("QS").mean()
     return m, q
+
+# ---------- Load series from Neon ----------
+def _load_series_from_neon(
+    db: str,
+    target_value: str,
+    state: Optional[str],
+    county_name: Optional[str],
+    city_name: Optional[str],
+    cbsa_name: Optional[str],
+    agg: str,
+    ftype: str,
+) -> pd.DataFrame:
+    """
+    Pulls live rows from Neon and returns DATE, VALUE (daily).
+    Maps:
+      - target_value -> "Parameter Name"
+      - state/county/city/cbsa -> filter columns
+      - agg: currently 'mean' supported (daily mean)
+    """
+    table = DEFAULT_TABLE  # using env/configurable table
+
+    q = f"""
+        SELECT
+            DATE("Date Local") AS date,
+            AVG("Arithmetic Mean") AS value
+        FROM {table}
+        WHERE "Parameter Name" = %s
+          AND (%s IS NULL OR "State Name"  = %s)
+          AND (%s IS NULL OR "County Name" = %s)
+          AND (%s IS NULL OR "City Name"   = %s)
+          AND (%s IS NULL OR "CBSA Name"   = %s)
+        GROUP BY DATE("Date Local")
+        ORDER BY DATE("Date Local")
+    """
+
+    params = [
+        _clean(target_value),
+        _clean(state), _clean(state),
+        _clean(county_name), _clean(county_name),
+        _clean(city_name), _clean(city_name),
+        _clean(cbsa_name), _clean(cbsa_name),
+    ]
+
+    try:
+        with _get_conn() as conn, conn.cursor() as cur:
+            cur.execute(q, params)
+            rows = cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Neon query failed: {str(e)}")
+
+    if not rows:
+        # Explicit error so you see why output would be empty
+        raise HTTPException(status_code=404, detail="No matching rows in Neon for the given filters.")
+
+    df = pd.DataFrame(rows)
+    df.rename(columns={"date":"DATE", "value":"VALUE"}, inplace=True)
+    df["DATE"] = pd.to_datetime(df["DATE"])
+    df = df.sort_values("DATE")
+    return df
 
 # ---------- Walk-forward models ----------
 def _walk_forward_ses(job_id: str, label: str, series: pd.Series, base_percent: int, span_percent: int) -> pd.Series:
@@ -158,7 +195,8 @@ def _walk_forward_arima(job_id: str, label: str, series: pd.Series, base_percent
         try:
             for order in [(1,1,0), (1,0,0)]:
                 try:
-                    fit = ARIMA(hist, order=order, enforce_stationarity=False, enforce_invertibility=False).fit(method_kwargs={"warn_convergence": False})
+                    fit = ARIMA(hist, order=order, enforce_stationarity=False, enforce_invertibility=False)\
+                          .fit(method_kwargs={"warn_convergence": False})
                     return float(fit.forecast(1)[0])
                 except Exception:
                     continue
@@ -198,7 +236,7 @@ def _gen_all(job_id: str, df: pd.DataFrame) -> pd.DataFrame:
 
     hist_start = pd.to_datetime(df["DATE"].min()).normalize()
     hist_end   = pd.to_datetime(df["DATE"].max()).normalize()
-    out_end_cap = (hist_end + pd.offsets.QuarterEnd(1)).normalize()  # upper bound; we will trim to coverage
+    out_end_cap = (hist_end + pd.offsets.QuarterEnd(1)).normalize()  # upper bound; we trim later
 
     def fill_days(series_pred: pd.Series, freq: str, span_end: pd.Timestamp) -> pd.Series:
         idx_all = pd.date_range(hist_start, span_end, freq="D")
@@ -217,18 +255,16 @@ def _gen_all(job_id: str, df: pd.DataFrame) -> pd.DataFrame:
     m_fill_arima = fill_days(arima_m, "MS", out_end_cap)
     q_fill_arima = fill_days(arima_q, "QS", out_end_cap)
 
-    # Trim to the last day where ANY forecast exists
     last_dates = [s.last_valid_index() for s in [m_fill_ses, q_fill_ses, m_fill_hwes, q_fill_hwes, m_fill_arima, q_fill_arima] if s is not None]
     coverage_end = max([d for d in last_dates if d is not None], default=hist_end)
 
     all_dates = pd.date_range(hist_start, coverage_end, freq="D")
     out = pd.DataFrame({"DATE": all_dates})
 
-    # VALUE only within history; NaN beyond hist_end
+    # VALUE within history; NaN beyond hist_end
     value_map = df.set_index("DATE")["VALUE"]
     out["VALUE"] = value_map.reindex(all_dates).values
 
-    # Forecast columns
     out["SES-M"]   = m_fill_ses.reindex(all_dates).values
     out["SES-Q"]   = q_fill_ses.reindex(all_dates).values
     out["HWES-M"]  = m_fill_hwes.reindex(all_dates).values
@@ -239,28 +275,30 @@ def _gen_all(job_id: str, df: pd.DataFrame) -> pd.DataFrame:
     _pulse(job_id, state="running", message="Composing output CSV…", percent=98, done=0, total=1)
     return out
 
-# ---------- Params ----------
-def _coalesce_state(state: Optional[str], state_name: Optional[str]) -> str:
-    return (state or state_name or "").strip()
-
 # ---------- Runner ----------
 def _spawn_runner(job_id: str, params: dict):
     def _runner():
         try:
-            _pulse(job_id, state="running", message="Loading data…", percent=8, done=0, total=1)
-            df = _load_series(params["db"], params["target_value"], params.get("state"), params.get("county_name"),
-                              params.get("city_name"), params.get("cbsa_name"), params.get("agg","mean"), params.get("ftype","F"))
+            _pulse(job_id, state="running", message="Loading data (Neon)…", percent=8, done=0, total=1)
+            df = _load_series_from_neon(
+                params["db"], params["target_value"],
+                params.get("state"), params.get("county_name"),
+                params.get("city_name"), params.get("cbsa_name"),
+                params.get("agg","mean"), params.get("ftype","F")
+            )
             out = _gen_all(job_id, df)
-            fname = _compose_instance_name(params["target_value"], params.get("state"), params.get("county_name"),
-                                           params.get("city_name"), params.get("cbsa_name"), params.get("ftype","F")) + ".csv"
-            out_path = os.path.join(_OUTPUT_DIR, fname)
+            inst_name = _compose_instance_name(
+                params["target_value"], params.get("state"), params.get("county_name"),
+                params.get("city_name"), params.get("cbsa_name"), params.get("ftype","F")
+            )
+            out_path = os.path.join(_OUTPUT_DIR, f"{inst_name}.csv")
             out.to_csv(out_path, index=False)
             _pulse(job_id, state="ready", message="Completed", percent=100, done=1, total=1, output_file=out_path)
         except Exception as e:
             _pulse(job_id, state="error", message=str(e), percent=0, done=0, total=1)
     threading.Thread(target=_runner, daemon=True).start()
 
-# ================== Endpoints ==================
+# ---------- API ----------
 @router.get("/classical/probe")
 def classical_probe(
     db: str,
@@ -274,20 +312,13 @@ def classical_probe(
     ftype: str = "F",
 ):
     _state = (state or state_name or "").strip()
-    src_path = _resolve_input_path(target_value, _state, county_name, city_name, cbsa_name, ftype)
-    if not src_path:
-        raise HTTPException(status_code=404, detail=f"No input CSV found under {_INPUT_DIR}")
-    df = pd.read_csv(src_path)
-    # find a date-like column for quick probe
-    date_col = next((c for c in df.columns if c.lower().strip() in ("date","date local")), None)
-    if date_col is None:
-        date_col = next((c for c in df.columns if "date" in c.lower()), None)
-    dates = pd.to_datetime(df[date_col], errors="coerce")
+    df = _load_series_from_neon(db, target_value, _state, county_name, city_name, cbsa_name, agg, ftype)
     return {
         "rows": int(len(df)),
-        "source_path": src_path,
-        "start_date_raw": str(pd.to_datetime(dates.min())) if len(df) else None,
-        "end_date_raw": str(pd.to_datetime(dates.max())) if len(df) else None,
+        "start_date": df["DATE"].min().strftime("%Y-%m-%d"),
+        "end_date": df["DATE"].max().strftime("%Y-%m-%d"),
+        "source": "neon",
+        "table": DEFAULT_TABLE,
     }
 
 @router.post("/classical/start")
