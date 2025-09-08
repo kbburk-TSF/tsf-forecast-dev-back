@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from typing import Optional, Tuple
-import os, uuid, threading, time, json
+import os, uuid, threading, time, json, datetime
 import pandas as pd
 import numpy as np
 
@@ -293,7 +293,13 @@ def _spawn_runner(job_id: str, params: dict):
                 params["target_value"], params.get("state"), params.get("county_name"),
                 params.get("city_name"), params.get("cbsa_name"), params.get("ftype","F")
             )
-            out_path = os.path.join(_OUTPUT_DIR, f"{inst_name}.csv")
+            # >>> CHANGE 1/2: append date (YYYY-MM-DD) to CSV file name
+            _today = datetime.date.today().strftime("%Y-%m-%d")
+            _base_name = f"{inst_name}_{_today}"
+            # >>> CHANGE 2/2: include forecast_id & forecast_name as first columns
+            out.insert(0, "forecast_id", job_id)
+            out.insert(1, "forecast_name", _base_name)
+            out_path = os.path.join(_OUTPUT_DIR, f"{_base_name}.csv")
             out.to_csv(out_path, index=False)
             _pulse(job_id, state="ready", message="Completed", percent=100, done=1, total=1, output_file=out_path)
         except Exception as e:
