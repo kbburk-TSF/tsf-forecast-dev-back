@@ -8,7 +8,7 @@ from backend.routes.meta import router as meta_router
 from backend.routes.classical import router as classical_router
 import os
 
-app = FastAPI(title="TSF Backend", version=BUILD_ID, version="2.0.3")
+app = FastAPI(title="TSF Backend", version=BUILD_ID)
 
 # CORS (env-driven; defaults to "*")
 env_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
