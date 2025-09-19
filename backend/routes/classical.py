@@ -1,3 +1,4 @@
+# BUILD 2025-09-19T14:58:35.185134
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from typing import Optional, Tuple
@@ -430,4 +431,3 @@ def classical_download(job_id: str = Query(...)):
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Output not found")
     return FileResponse(path, filename=os.path.basename(path), media_type="text/csv")
-    

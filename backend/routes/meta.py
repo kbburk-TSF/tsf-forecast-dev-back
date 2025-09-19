@@ -1,3 +1,4 @@
+# BUILD 2025-09-19T14:58:35.185134
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import text
 from backend.database import engine
@@ -51,4 +52,3 @@ def get_filters(db: str, target: str = Query(...)):
             vals = conn.execute(text(sql), {"target": target}).scalars().all()
             filters[fcol] = [v for v in vals if v is not None]
     return {"target": target, "filters": filters}
-

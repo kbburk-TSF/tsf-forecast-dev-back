@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from backend.version import BUILD_ID
 from fastapi.middleware.cors import CORSMiddleware
 from backend.routes.data import router as data_router
 from backend.routes.aggregate import router as agg_router
@@ -7,7 +8,7 @@ from backend.routes.meta import router as meta_router
 from backend.routes.classical import router as classical_router
 import os
 
-app = FastAPI(title="TSF Backend", version="2.0.3")
+app = FastAPI(title="TSF Backend", version=BUILD_ID, version="2.0.3")
 
 # CORS (env-driven; defaults to "*")
 env_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
