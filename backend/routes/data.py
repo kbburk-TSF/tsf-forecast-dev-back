@@ -1,4 +1,4 @@
-# BUILD: 2025-09-19 exact JSON contract for App.jsx
+# BUILD: pinpoint routes
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import text
 from backend.database import engine
@@ -10,6 +10,7 @@ TABLE = 'air_quality_raw'  # public schema
 
 @router.get("/{db}/targets")
 def get_targets(db: str):
+    print(f"[DATA] /targets db={db}")
     if db not in VALID_DBS:
         raise HTTPException(status_code=404, detail=f"Unknown database {db}")
     sql = text('SELECT DISTINCT "Parameter Name" AS target FROM ' + TABLE + ' WHERE "Parameter Name" IS NOT NULL ORDER BY 1')
@@ -18,7 +19,8 @@ def get_targets(db: str):
     return {"targets": [r.target for r in rows]}
 
 @router.get("/{db}/filters")
-def get_filters(db: str, target: str = Query(..., alias="target", description="Value for Parameter Name")):
+def get_filters(db: str, target: str = Query(..., description="Value for Parameter Name")):
+    print(f"[DATA] /filters db={db} target={target}")
     if db not in VALID_DBS:
         raise HTTPException(status_code=404, detail=f"Unknown database {db}")
     sql = text('SELECT DISTINCT "State Name" AS state FROM ' + TABLE + ' WHERE "Parameter Name" = :target AND "State Name" IS NOT NULL ORDER BY 1')

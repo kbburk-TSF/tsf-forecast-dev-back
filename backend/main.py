@@ -1,18 +1,19 @@
-# BUILD: 2025-09-19T16:13:13.795646 CORS+Health+Upload Enabled
-from fastapi import FastAPI
+# BUILD: 2025-09-19T17:30:23.672847 pinpoint diagnostics
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from backend.version import BUILD_ID
+from starlette.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+try:
+    from backend.version import BUILD_ID
+except Exception:
+    BUILD_ID = "2025-09-19T17:30:23.672847"
 
 from backend.routes.data import router as data_router
-from backend.routes.aggregate import router as aggregate_router
-from backend.routes.forecast import router as forecast_router
-from backend.routes.upload import router as upload_router  # requires python-multipart
-from backend.routes.classical import router as classical_router
-from backend.routes.meta import router as meta_router
 
 app = FastAPI(title="TSF Backend", version=BUILD_ID)
 
-# Permissive CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,19 +22,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routers
-app.include_router(data_router)
-app.include_router(aggregate_router)
-app.include_router(forecast_router)
-app.include_router(upload_router)
-app.include_router(classical_router)
-app.include_router(meta_router)
+# Simple request logger
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    print(f"[REQ] {request.method} {request.url.path} qs={request.url.query}")
+    resp = await call_next(request)
+    print(f"[RESP] {request.method} {request.url.path} -> {resp.status_code}")
+    return resp
 
-# Health + root
+# Include routers
+app.include_router(data_router)
+
+# 404 handler that reveals the path and registered routes
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    if exc.status_code == 404:
+        routes = [r.path for r in app.router.routes if hasattr(r, "path")]
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "Not Found", "path": request.url.path, "qs": request.url.query, "routes": routes},
+        )
+    return JSONResponse(status_code=exc.status_code, content={"detail": str(exc.detail)})
+
 @app.get("/health")
 def health():
     return {"ok": True, "version": BUILD_ID}
-
-@app.get("/")
-def root():
-    return {"service": "TSF Backend", "version": BUILD_ID}
