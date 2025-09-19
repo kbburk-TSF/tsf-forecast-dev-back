@@ -51,3 +51,4 @@ def get_filters(db: str, target: str = Query(...)):
             vals = conn.execute(text(sql), {"target": target}).scalars().all()
             filters[fcol] = [v for v in vals if v is not None]
     return {"target": target, "filters": filters}
+

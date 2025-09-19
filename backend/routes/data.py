@@ -42,3 +42,4 @@ def last_date(state: str, parameter: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail={"sql": sql, "state": state, "parameter": parameter, "error": str(e)})
     return {"state": state, "parameter": parameter, "last_date": max_date}
+

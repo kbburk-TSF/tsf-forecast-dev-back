@@ -430,3 +430,4 @@ def classical_download(job_id: str = Query(...)):
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Output not found")
     return FileResponse(path, filename=os.path.basename(path), media_type="text/csv")
+    
