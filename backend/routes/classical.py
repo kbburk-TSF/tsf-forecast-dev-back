@@ -1,4 +1,3 @@
-# BUILD 2025-09-19T14:58:35.185134
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from typing import Optional, Tuple
@@ -86,17 +85,7 @@ def _get_conn():
         cursor_factory=RealDictCursor, sslmode="require"
     )
 
-
-def _get_engine_conn():
-    import re, os
-    dsn = os.getenv("ENGINE_DATABASE_URL") or os.getenv("DATABASE_URL")
-    if not dsn:
-        raise HTTPException(status_code=500, detail="Engine connection env var not set (ENGINE_DATABASE_URL or DATABASE_URL).")
-    dsn = re.sub(r"^(postgresql?|postgres)\+psycopg2?://", r"\1://", dsn, flags=re.I)
-    if "sslmode=" not in dsn:
-        dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
-    return psycopg2.connect(dsn, cursor_factory=RealDictCursor)
-DEFAULT_TABLE = os.getenv("TSF_TABLE", 'demo_air_quality.air_quality_raw')
+DEFAULT_TABLE = "air_quality_raw"
 
 # ---------- Load series from Neon ----------
 def _load_series_from_neon(
@@ -312,22 +301,6 @@ def _spawn_runner(job_id: str, params: dict):
             out.insert(1, "forecast_name", _base_name)
             out_path = os.path.join(_OUTPUT_DIR, f"{_base_name}.csv")
             out.to_csv(out_path, index=False)
-            # Also push to engine.staging_historical to trigger pipeline
-            try:
-                _pulse(job_id, state="running", message="Uploading to engine.staging_historical…", percent=99, done=0, total=1)
-                from io import StringIO
-                csv_buf = StringIO()
-                out.to_csv(csv_buf, index=False)
-                csv_buf.seek(0)
-                with _get_engine_conn() as econn:
-                    with econn.cursor() as cur:
-                        cur.copy_expert("COPY engine.staging_historical FROM STDIN WITH CSV HEADER", csv_buf)
-                    econn.commit()
-            except Exception as _e:
-                # Surface but do not crash the job—frontend still gets CSV
-                _pulse(job_id, state="error", message=f"Engine upload failed: {_e}", percent=99, done=0, total=1)
-                raise
-
             _pulse(job_id, state="ready", message="Completed", percent=100, done=1, total=1, output_file=out_path)
         except Exception as e:
             _pulse(job_id, state="error", message=str(e), percent=0, done=0, total=1)

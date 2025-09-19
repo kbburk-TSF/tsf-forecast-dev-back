@@ -1,12 +1,11 @@
-# BUILD 2025-09-19T14:58:35.185134
 from fastapi import APIRouter, Query, HTTPException
 from sqlalchemy import text
 from backend.database import engine
 
 router = APIRouter(prefix="/data", tags=["data"])
 
-DB_SCHEMA = "air_quality_demo_data"
-TABLE = f"{DB_SCHEMA}.air_quality_raw"
+DB_SCHEMA = "public"
+TABLE = "air_quality_raw"
 
 def _safe_query(sql: str, params: dict):
     try:

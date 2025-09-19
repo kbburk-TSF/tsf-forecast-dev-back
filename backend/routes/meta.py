@@ -1,4 +1,3 @@
-# BUILD 2025-09-19T14:58:35.185134
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import text
 from backend.database import engine

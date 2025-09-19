@@ -1,49 +1,40 @@
-# BUILD: 2025-09-19 CORS+Health (skip upload router if python-multipart missing)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-try:
-    from backend.version import BUILD_ID
-except Exception:
-    BUILD_ID = "dev"
-
 from backend.routes.data import router as data_router
-from backend.routes.aggregate import router as aggregate_router
+from backend.routes.aggregate import router as agg_router
 from backend.routes.forecast import router as forecast_router
-# upload router is optional; if python-multipart is missing, importing it will raise
-try:
-    from backend.routes.upload import router as upload_router  # requires python-multipart
-    HAS_UPLOAD = True
-except Exception:
-    HAS_UPLOAD = False
-from backend.routes.classical import router as classical_router
 from backend.routes.meta import router as meta_router
+from backend.routes.classical import router as classical_router
+import os
 
-app = FastAPI(title="TSF Backend", version=BUILD_ID)
+app = FastAPI(title="TSF Backend", version="2.0.3")
 
-# Permissive CORS
+# CORS (env-driven; defaults to "*")
+env_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
+allowed = [o.strip() for o in env_origins.split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=allowed,
+    allow_credentials=False,   # set True only if you configure specific origins
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Routers
+# Mount routers exactly once
 app.include_router(data_router)
-app.include_router(aggregate_router)
+app.include_router(agg_router)
 app.include_router(forecast_router)
-if HAS_UPLOAD:
-    app.include_router(upload_router)
-app.include_router(classical_router)
 app.include_router(meta_router)
+app.include_router(classical_router)
 
-# Health + root
 @app.get("/health")
 def health():
-    return {"ok": True, "version": BUILD_ID, "upload_enabled": HAS_UPLOAD}
+    return {"status": "ok", "database": "up", "schema": "ready"}
 
-@app.get("/")
-def root():
-    return {"service": "TSF Backend", "version": BUILD_ID}
+@app.get("/version")
+def version():
+    try:
+        with open("VERSION", "r") as f:
+            return {"version": f.read().strip()}
+    except Exception:
+        return {"version": "unknown"}
