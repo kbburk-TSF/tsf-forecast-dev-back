@@ -1,44 +1,36 @@
-from fastapi import APIRouter, Query, HTTPException
-from sqlalchemy import text
+# Data routes (DB binding for Air Quality Demo)
+from fastapi import APIRouter, HTTPException, Query
 from backend.database import engine
+from sqlalchemy import text
 
 router = APIRouter(prefix="/data", tags=["data"])
 
-DB_SCHEMA = "public"
-TABLE = "air_quality_raw"
+DB_SCHEMA = "air_quality_demo_data"  # database (Render connects to this DB via DATABASE_URL)
+TABLE = "air_quality_raw"            # table in public schema
 
-def _safe_query(sql: str, params: dict):
-    try:
-        with engine.begin() as conn:
-            res = conn.execute(text(sql), params).mappings().all()
-            return [dict(r) for r in res]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"sql": sql, "params": params, "error": str(e)})
+@router.get("/{db}/targets")
+def get_targets(db: str):
+    if db not in ("air_quality_demo_data", "demo_air_quality"):
+        raise HTTPException(status_code=400, detail=f"Unknown database {db}")
+    q = text(f"""
+        SELECT DISTINCT "Parameter Name" AS target
+        FROM {TABLE}
+        ORDER BY 1
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(q).fetchall()
+    return [r[0] for r in rows]
 
-@router.get("/air_quality/last")
-def last_rows(limit: int = Query(50, ge=1, le=500)):
-    sql = f"""
-    SELECT "Date Local", "Parameter Name", "Arithmetic Mean",
-           "Local Site Name", "State Name", "County Name",
-           "City Name", "CBSA Name"
-    FROM {TABLE}
-    ORDER BY "Date Local" DESC
-    LIMIT :limit
-    """
-    rows = _safe_query(sql, {"limit": limit})
-    return {"rows": rows}
-
-@router.get("/air_quality/last_date")
-def last_date(state: str, parameter: str):
-    sql = f"""
-    SELECT MAX("Date Local") AS max_date
-    FROM {TABLE}
-    WHERE "State Name" = :state AND "Parameter Name" = :parameter
-    """
-    try:
-        with engine.begin() as conn:
-            row = conn.execute(text(sql), {"state": state, "parameter": parameter}).first()
-            max_date = row[0] if row else None
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"sql": sql, "state": state, "parameter": parameter, "error": str(e)})
-    return {"state": state, "parameter": parameter, "last_date": max_date}
+@router.get("/{db}/filters")
+def get_filters(db: str, target: str = Query(...)):
+    if db not in ("air_quality_demo_data", "demo_air_quality"):
+        raise HTTPException(status_code=400, detail=f"Unknown database {db}")
+    q = text(f"""
+        SELECT DISTINCT "State Name"
+        FROM {TABLE}
+        WHERE "Parameter Name" = :target
+        ORDER BY 1
+    """)
+    with engine.connect() as conn:
+        states = [r[0] for r in conn.execute(q, {{'target': target}}).fetchall()]
+    return {{"states": states}}
