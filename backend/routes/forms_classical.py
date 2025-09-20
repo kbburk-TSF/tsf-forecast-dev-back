@@ -1,9 +1,9 @@
 # =====================================================================
 # File: backend/routes/forms_classical.py
-# Version: v1.0.3 — 2025-09-20
+# Version: v1.0.4 — 2025-09-20
 # Changes:
-# - v1.0.3: Tolerate DATABASE_URL values that include channel_binding=require
-#           by removing/neutralizing the parameter (URL or DSN form).
+# - v1.0.4: Use air_quality_demo_data.air_quality_raw (not demo_air_quality).
+# - v1.0.3: DSN sanitization for channel_binding.
 # - v1.0.2: Inline HTML (no Jinja).
 # =====================================================================
 
@@ -28,23 +28,18 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 router = APIRouter()
 
 def _sanitize_conninfo(dsn: str) -> str:
-    """Remove/neutralize channel_binding from either URL-style or DSN-style strings."""
     if not dsn:
         return dsn
-    # URL form: postgresql://...?...&channel_binding=require
     if '://' in dsn:
         try:
             parts = urlsplit(dsn)
             q = dict(parse_qsl(parts.query, keep_blank_values=True))
             if 'channel_binding' in q:
-                # drop it to avoid incompatible libpq errors
                 q.pop('channel_binding', None)
             new_query = urlencode(q, doseq=True)
             return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
         except Exception:
-            # fall through to DSN sanitation
             pass
-    # DSN form: key=value key=value
     tokens = []
     for tok in dsn.split():
         if not tok.lower().startswith('channel_binding='):
@@ -57,25 +52,27 @@ def db_conn():
     clean = _sanitize_conninfo(DATABASE_URL)
     return psycopg.connect(clean, row_factory=dict_row)
 
+SCHEMA_TABLE = "air_quality_demo_data.air_quality_raw"
+
 def list_parameters_and_states():
     params, states, date_min, date_max = [], [], None, None
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT DISTINCT parameter FROM demo_air_quality.air_quality_raw
+            cur.execute(f"""
+                SELECT DISTINCT parameter FROM {SCHEMA_TABLE}
                 WHERE parameter IS NOT NULL
                 ORDER BY parameter;
             """)
             params = [r["parameter"] for r in cur.fetchall()]
-            cur.execute("""
-                SELECT DISTINCT state_code FROM demo_air_quality.air_quality_raw
+            cur.execute(f"""
+                SELECT DISTINCT state_code FROM {SCHEMA_TABLE}
                 WHERE state_code IS NOT NULL
                 ORDER BY state_code;
             """)
             states = [r["state_code"] for r in cur.fetchall()]
-            cur.execute("""
+            cur.execute(f"""
                 SELECT MIN(date_local) AS dmin, MAX(date_local) AS dmax
-                FROM demo_air_quality.air_quality_raw;
+                FROM {SCHEMA_TABLE};
             """)
             row = cur.fetchone()
             if row:
@@ -84,9 +81,9 @@ def list_parameters_and_states():
     return params, states, date_min, date_max
 
 def fetch_series_history(parameter: str, state_code: str, start_date: Optional[str], end_date: Optional[str]):
-    sql = """
+    sql = f"""
         SELECT date_local::date AS date, arithmetic_mean::float8 AS value
-        FROM demo_air_quality.air_quality_raw
+        FROM {SCHEMA_TABLE}
         WHERE parameter = %s
           AND state_code = %s
           AND (%s IS NULL OR date_local::date >= %s::date)
