@@ -1,9 +1,10 @@
 # =====================================================================
 # File: backend/routes/forms_classical.py
-# Version: v1.0.2 — 2025-09-20
-# Purpose: Serve an HTML form (without Jinja) that reads options from DB
-#          and generates a classical forecast CSV; saves to staging_historical
-#          and streams the CSV back to the browser.
+# Version: v1.0.3 — 2025-09-20
+# Changes:
+# - v1.0.3: Tolerate DATABASE_URL values that include channel_binding=require
+#           by removing/neutralizing the parameter (URL or DSN form).
+# - v1.0.2: Inline HTML (no Jinja).
 # =====================================================================
 
 import csv
@@ -11,6 +12,7 @@ import os
 import io
 from datetime import date
 from typing import Optional, List
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
@@ -25,10 +27,35 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 router = APIRouter()
 
+def _sanitize_conninfo(dsn: str) -> str:
+    """Remove/neutralize channel_binding from either URL-style or DSN-style strings."""
+    if not dsn:
+        return dsn
+    # URL form: postgresql://...?...&channel_binding=require
+    if '://' in dsn:
+        try:
+            parts = urlsplit(dsn)
+            q = dict(parse_qsl(parts.query, keep_blank_values=True))
+            if 'channel_binding' in q:
+                # drop it to avoid incompatible libpq errors
+                q.pop('channel_binding', None)
+            new_query = urlencode(q, doseq=True)
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+        except Exception:
+            # fall through to DSN sanitation
+            pass
+    # DSN form: key=value key=value
+    tokens = []
+    for tok in dsn.split():
+        if not tok.lower().startswith('channel_binding='):
+            tokens.append(tok)
+    return ' '.join(tokens)
+
 def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    clean = _sanitize_conninfo(DATABASE_URL)
+    return psycopg.connect(clean, row_factory=dict_row)
 
 def list_parameters_and_states():
     params, states, date_min, date_max = [], [], None, None
