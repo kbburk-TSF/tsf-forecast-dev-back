@@ -1,26 +1,22 @@
 # =====================================================================
 # File: backend/routes/forms_classical.py
-# Version: v1.0.1 — 2025-09-20
-# Changes:
-# - v1.0.1: Keep logic; ensure template path is correct relative to package.
+# Version: v1.0.2 — 2025-09-20
+# Purpose: Serve an HTML form (without Jinja) that reads options from DB
+#          and generates a classical forecast CSV; saves to staging_historical
+#          and streams the CSV back to the browser.
 # =====================================================================
 
 import csv
 import os
 import io
 from datetime import date
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
 
 import psycopg
 from psycopg.rows import dict_row
-
-# templates live at backend/templates/forms/classical.html
-TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates")
-templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
 STAGING_DIR = os.getenv("STAGING_HISTORICAL_DIR", os.path.join(os.getcwd(), "staging_historical"))
 os.makedirs(STAGING_DIR, exist_ok=True)
@@ -119,35 +115,77 @@ def build_csv_bytes(rows):
     buf.close()
     return data
 
+def _options(opts: List[str]) -> str:
+    return "\n".join([f'<option value="{o}">{o}</option>' for o in opts])
+
 @router.get("/classical", response_class=HTMLResponse)
 def classical_form(request: Request):
     try:
         parameters, states, dmin, dmax = list_parameters_and_states()
+        date_min = dmin.isoformat() if dmin else ""
+        date_max = dmax.isoformat() if dmax else ""
+        html = f"""<!doctype html>
+<html><head><meta charset='utf-8'><title>Classical Forecast — Backend Form</title>
+<meta name='viewport' content='width=device-width, initial-scale=1' />
+<style>
+body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }}
+.wrap {{ max-width: 760px; margin: 0 auto; }}
+form {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
+label {{ display: block; font-weight: 600; margin-bottom: 6px; }}
+input, select {{ width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; }}
+.full {{ grid-column: 1 / -1; }}
+.actions {{ grid-column: 1 / -1; display: flex; gap: 12px; }}
+button {{ padding: 10px 16px; border: 0; border-radius: 6px; cursor: pointer; }}
+.primary {{ background: #1f6feb; color: #fff; }}
+.muted {{ background: #eee; }}
+</style></head>
+<body><div class='wrap'>
+<h1>Classical Forecast — Backend Form</h1>
+<form method='post' action='/forms/classical/generate'>
+  <div>
+    <label for='parameter'>Parameter</label>
+    <select id='parameter' name='parameter' required>
+      {_options(parameters)}
+    </select>
+  </div>
+  <div>
+    <label for='state_code'>State</label>
+    <select id='state_code' name='state_code' required>
+      {_options(states)}
+    </select>
+  </div>
+  <div>
+    <label for='start_date'>Start date</label>
+    <input type='date' id='start_date' name='start_date' min='{date_min}' max='{date_max}' />
+  </div>
+  <div>
+    <label for='end_date'>End date</label>
+    <input type='date' id='end_date' name='end_date' min='{date_min}' max='{date_max}' />
+  </div>
+  <div>
+    <label for='method'>Method</label>
+    <select id='method' name='method'>
+      <option value='seasonal_naive_dow'>Seasonal Naive (DOW)</option>
+      <option value='ewma'>EWMA</option>
+    </select>
+  </div>
+  <div>
+    <label for='horizon'>Horizon (days)</label>
+    <input type='number' id='horizon' name='horizon' value='30' min='1' max='365' />
+  </div>
+  <div class='actions'>
+    <button class='primary' type='submit'>Generate CSV</button>
+    <a class='muted' href='/forms/classical'><button type='button' class='muted'>Reset</button></a>
+  </div>
+  <div class='full'>
+    <p>On submit, the backend queries history, generates a classical forecast,
+    saves a CSV into <code>staging_historical</code>, and downloads it.</p>
+  </div>
+</form>
+</div></body></html>"""
+        return HTMLResponse(content=html, status_code=200)
     except Exception as e:
-        return templates.TemplateResponse(
-            "forms/classical.html",
-            {
-                "request": request,
-                "parameters": [],
-                "states": [],
-                "date_min": None,
-                "date_max": None,
-                "error": str(e),
-            },
-            status_code=200,
-        )
-
-    return templates.TemplateResponse(
-        "forms/classical.html",
-        {
-            "request": request,
-            "parameters": parameters,
-            "states": states,
-            "date_min": dmin.isoformat() if dmin else None,
-            "date_max": dmax.isoformat() if dmax else None,
-            "error": None,
-        },
-    )
+        return HTMLResponse(content=f"<pre>Database error: {e}</pre>", status_code=200)
 
 @router.post("/classical/generate")
 def classical_generate(
