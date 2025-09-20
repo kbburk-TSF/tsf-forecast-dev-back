@@ -1,25 +1,40 @@
-# =====================================================================
-# File: backend/main.py
-# Version: v1.2.1 — 2025-09-20
-# Change log:
-# - v1.2.1: Patch quoting bug in forms_classical._options().
-# - v1.2.0: DB-backed form; aggregation + CSV save/download.
-# =====================================================================
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from backend.routes.data import router as data_router
+from backend.routes.aggregate import router as agg_router
+from backend.routes.forecast import router as forecast_router
+from backend.routes.meta import router as meta_router
+from backend.routes.classical import router as classical_router
+import os
 
-from backend.routes.forms_classical import router as forms_classical_router
+app = FastAPI(title="TSF Backend", version="2.0.3")
 
-app = FastAPI(title="TSF Backend", version="1.2.1")
-
+# CORS (env-driven; defaults to "*")
+env_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
+allowed = [o.strip() for o in env_origins.split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+    allow_origins=allowed,
+    allow_credentials=False,   # set True only if you configure specific origins
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-app.include_router(forms_classical_router, prefix="/forms", tags=["forms"])
+# Mount routers exactly once
+app.include_router(data_router)
+app.include_router(agg_router)
+app.include_router(forecast_router)
+app.include_router(meta_router)
+app.include_router(classical_router)
 
-@app.get("/", tags=["health"])
-def root():
-    return {"ok": True, "app": "TSF Backend", "version": app.version}
+@app.get("/health")
+def health():
+    return {"status": "ok", "database": "up", "schema": "ready"}
+
+@app.get("/version")
+def version():
+    try:
+        with open("VERSION", "r") as f:
+            return {"version": f.read().strip()}
+    except Exception:
+        return {"version": "unknown"}

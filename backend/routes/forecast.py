@@ -8,7 +8,7 @@ from datetime import date
 
 router = APIRouter(prefix="/forecast", tags=["forecast"])
 
-DB_SCHEMA = "demo_air_quality"
+DB_SCHEMA = "air_quality_demo_data"
 TABLE = f"{DB_SCHEMA}.air_quality_raw"
 
 def _history_df(state: str, parameter: str, agg: str):
@@ -72,9 +72,9 @@ def export_state_daily_csv(
     buf = io.StringIO()
     out.to_csv(buf, index=False)
 
-    # Filename: tsf-demo_air_quality-<state>-<parameter>-<agg>-<method>-<YYYYMMDD>.csv
+    # Filename: tsf-air_quality_demo_data-<state>-<parameter>-<agg>-<method>-<YYYYMMDD>.csv
     today = date.today().strftime("%Y%m%d")
-    fname = f"tsf-demo_air_quality-{state}-{parameter}-{agg}-{method}-{today}.csv"
+    fname = f"tsf-air_quality_demo_data-{state}-{parameter}-{agg}-{method}-{today}.csv"
     return Response(
         content=buf.getvalue(),
         media_type="text/csv",

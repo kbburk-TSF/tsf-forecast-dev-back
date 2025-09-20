@@ -1,55 +1,44 @@
-# CLEAN DATA ROUTES
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Query, HTTPException
 from sqlalchemy import text
 from backend.database import engine
 
 router = APIRouter(prefix="/data", tags=["data"])
 
-VALID_DBS = {"air_quality_demo_data", "demo_air_quality"}
+DB_SCHEMA = "air_quality_demo_data"
+TABLE = f"{DB_SCHEMA}.air_quality_raw"
 
-CANDIDATE_TABLES = [
-    'air_quality_raw',                # preferred
-    'air_quality_daily',              # fallback candidates (unknown schema)
-    'public.air_quality_raw',
-    'public.air_quality_daily',
-]
+def _safe_query(sql: str, params: dict):
+    try:
+        with engine.begin() as conn:
+            res = conn.execute(text(sql), params).mappings().all()
+            return [dict(r) for r in res]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"sql": sql, "params": params, "error": str(e)})
 
-def find_first_existing_table(conn):
-    for t in CANDIDATE_TABLES:
-        try:
-            conn.execute(text(f"SELECT 1 FROM {t} LIMIT 1"))
-            return t
-        except Exception:
-            continue
-    return None
+@router.get("/air_quality/last")
+def last_rows(limit: int = Query(50, ge=1, le=500)):
+    sql = f"""
+    SELECT "Date Local", "Parameter Name", "Arithmetic Mean",
+           "Local Site Name", "State Name", "County Name",
+           "City Name", "CBSA Name"
+    FROM {TABLE}
+    ORDER BY "Date Local" DESC
+    LIMIT :limit
+    """
+    rows = _safe_query(sql, {"limit": limit})
+    return {"rows": rows}
 
-@router.get("/{db}/targets")
-def get_targets(db: str):
-    if db not in VALID_DBS:
-        raise HTTPException(status_code=404, detail=f"Unknown database {db}")
-    with engine.connect() as conn:
-        table = find_first_existing_table(conn)
-        if not table:
-            return {"targets": [], "note": "no candidate table found in CANDIDATE_TABLES"}
-        sql = text(f'SELECT DISTINCT "Parameter Name" AS target FROM {table} WHERE "Parameter Name" IS NOT NULL ORDER BY 1')
-        try:
-            rows = conn.execute(sql).all()
-            return {"targets": [r.target for r in rows], "table": table}
-        except Exception as e:
-            # Return structured error so frontend shows real cause
-            raise HTTPException(status_code=500, detail=f"targets query failed on {table}: {e}")
-
-@router.get("/{db}/filters")
-def get_filters(db: str, target: str = Query(..., description='Value of "Parameter Name"')):
-    if db not in VALID_DBS:
-        raise HTTPException(status_code=404, detail=f"Unknown database {db}")
-    with engine.connect() as conn:
-        table = find_first_existing_table(conn)
-        if not table:
-            return {"filters": {"states": []}, "note": "no candidate table found in CANDIDATE_TABLES"}
-        sql = text(f'SELECT DISTINCT "State Name" AS state FROM {table} WHERE "Parameter Name" = :target AND "State Name" IS NOT NULL ORDER BY 1')
-        try:
-            rows = conn.execute(sql, {"target": target}).all()
-            return {"filters": {"states": [r.state for r in rows]}, "table": table}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"filters query failed on {table}: {e}")
+@router.get("/air_quality/last_date")
+def last_date(state: str, parameter: str):
+    sql = f"""
+    SELECT MAX("Date Local") AS max_date
+    FROM {TABLE}
+    WHERE "State Name" = :state AND "Parameter Name" = :parameter
+    """
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(text(sql), {"state": state, "parameter": parameter}).first()
+            max_date = row[0] if row else None
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"sql": sql, "state": state, "parameter": parameter, "error": str(e)})
+    return {"state": state, "parameter": parameter, "last_date": max_date}
