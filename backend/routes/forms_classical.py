@@ -1,9 +1,8 @@
 # =====================================================================
 # File: backend/routes/forms_classical.py
-# Version: v1.0.0 — 2025-09-20
-# Purpose: Serve an HTML form that reads options from the DB and generates
-#          a classical forecast CSV; saves to staging_historical and
-#          streams the CSV back to the browser.
+# Version: v1.0.1 — 2025-09-20
+# Changes:
+# - v1.0.1: Keep logic; ensure template path is correct relative to package.
 # =====================================================================
 
 import csv
@@ -19,6 +18,7 @@ from fastapi.templating import Jinja2Templates
 import psycopg
 from psycopg.rows import dict_row
 
+# templates live at backend/templates/forms/classical.html
 TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
@@ -105,10 +105,7 @@ def classical_forecast(series_rows, horizon: int = 30, method: str = "seasonal_n
         out.append({"date": r["date"], "value": r["value"], "type": "history"})
     for i in range(1, horizon + 1):
         next_d = last_date + dt.timedelta(days=i)
-        if method == "ewma":
-            fv = ewma_forecast()
-        else:
-            fv = s_naive(next_d)
+        fv = ewma_forecast() if method == "ewma" else s_naive(next_d)
         out.append({"date": next_d, "value": float(fv), "type": "forecast"})
     return out
 
