@@ -1,16 +1,16 @@
 # =====================================================================
 # File: backend/routes/forms_classical.py
-# Version: v1.0.4 — 2025-09-20
-# Changes:
-# - v1.0.4: Use air_quality_demo_data.air_quality_raw (not demo_air_quality).
-# - v1.0.3: DSN sanitization for channel_binding.
-# - v1.0.2: Inline HTML (no Jinja).
+# Version: v1.1.0 — 2025-09-20
+# Purpose: Serve an HTML form (no Jinja) with DB‑backed drop-downs:
+#   - Target => "Parameter Name"
+#   - Filter => "State Name"
+# Aggregates mean of "Arithmetic Mean" by "Date Local", writes CSV to
+# staging_historical, and streams the file back to the browser.
 # =====================================================================
 
 import csv
 import os
 import io
-from datetime import date
 from typing import Optional, List
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 import psycopg
 from psycopg.rows import dict_row
 
+# Where to save CSVs to trigger the pipeline
 STAGING_DIR = os.getenv("STAGING_HISTORICAL_DIR", os.path.join(os.getcwd(), "staging_historical"))
 os.makedirs(STAGING_DIR, exist_ok=True)
 
@@ -27,15 +28,17 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 router = APIRouter()
 
+# ---- Connection helpers ------------------------------------------------
+
 def _sanitize_conninfo(dsn: str) -> str:
+    """Remove 'channel_binding' if present (URL or DSN form)."""
     if not dsn:
         return dsn
     if '://' in dsn:
         try:
             parts = urlsplit(dsn)
             q = dict(parse_qsl(parts.query, keep_blank_values=True))
-            if 'channel_binding' in q:
-                q.pop('channel_binding', None)
+            q.pop('channel_binding', None)
             new_query = urlencode(q, doseq=True)
             return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
         except Exception:
@@ -52,103 +55,90 @@ def db_conn():
     clean = _sanitize_conninfo(DATABASE_URL)
     return psycopg.connect(clean, row_factory=dict_row)
 
-SCHEMA_TABLE = "air_quality_demo_data.air_quality_raw"
+TABLE = "air_quality_raw"
+COL_PARAM = '"Parameter Name"'
+COL_STATE = '"State Name"'
+COL_DATE  = '"Date Local"'
+COL_VALUE = '"Arithmetic Mean"'
 
-def list_parameters_and_states():
-    params, states, date_min, date_max = [], [], None, None
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT DISTINCT parameter FROM {SCHEMA_TABLE}
-                WHERE parameter IS NOT NULL
-                ORDER BY parameter;
-            """)
-            params = [r["parameter"] for r in cur.fetchall()]
-            cur.execute(f"""
-                SELECT DISTINCT state_code FROM {SCHEMA_TABLE}
-                WHERE state_code IS NOT NULL
-                ORDER BY state_code;
-            """)
-            states = [r["state_code"] for r in cur.fetchall()]
-            cur.execute(f"""
-                SELECT MIN(date_local) AS dmin, MAX(date_local) AS dmax
-                FROM {SCHEMA_TABLE};
-            """)
-            row = cur.fetchone()
-            if row:
-                date_min = row["dmin"]
-                date_max = row["dmax"]
-    return params, states, date_min, date_max
+# ---- DB queries --------------------------------------------------------
 
-def fetch_series_history(parameter: str, state_code: str, start_date: Optional[str], end_date: Optional[str]):
+def list_parameters() -> List[str]:
     sql = f"""
-        SELECT date_local::date AS date, arithmetic_mean::float8 AS value
-        FROM {SCHEMA_TABLE}
-        WHERE parameter = %s
-          AND state_code = %s
-          AND (%s IS NULL OR date_local::date >= %s::date)
-          AND (%s IS NULL OR date_local::date <= %s::date)
-        ORDER BY date_local;
+        SELECT DISTINCT {COL_PARAM} AS p
+        FROM {TABLE}
+        WHERE {COL_PARAM} IS NOT NULL
+        ORDER BY p
     """
     with db_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, (parameter, state_code, start_date, start_date, end_date, end_date))
+        cur.execute(sql)
+        return [r["p"] for r in cur.fetchall()]
+
+def list_states_for_param(param: Optional[str]) -> List[str]:
+    if not param:
+        sql = f"""
+            SELECT DISTINCT {COL_STATE} AS s
+            FROM {TABLE}
+            WHERE {COL_STATE} IS NOT NULL
+            ORDER BY s
+        """
+        args = ()
+    else:
+        sql = f"""
+            SELECT DISTINCT {COL_STATE} AS s
+            FROM {TABLE}
+            WHERE {COL_PARAM} = %s AND {COL_STATE} IS NOT NULL
+            ORDER BY s
+        """
+        args = (param,)
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, args)
+        return [r["s"] for r in cur.fetchall()]
+
+def date_bounds() -> Optional[dict]:
+    sql = f"""
+        SELECT MIN({COL_DATE})::date AS dmin, MAX({COL_DATE})::date AS dmax
+        FROM {TABLE}
+    """
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql)
+        row = cur.fetchone()
+        if row:
+            return {"min": row["dmin"], "max": row["dmax"]}
+        return None
+
+def aggregate_series(param: str, state: str):
+    sql = f"""
+        SELECT
+          {COL_DATE}::date AS date,
+          AVG({COL_VALUE})::float8 AS value
+        FROM {TABLE}
+        WHERE {COL_PARAM} = %s
+          AND {COL_STATE} = %s
+        GROUP BY {COL_DATE}
+        ORDER BY {COL_DATE}
+    """
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, (param, state))
         return cur.fetchall()
 
-def classical_forecast(series_rows, horizon: int = 30, method: str = "seasonal_naive_dow"):
-    import datetime as dt
-    from collections import defaultdict
+# ---- HTML helpers ------------------------------------------------------
 
-    history = [{"date": r["date"], "value": float(r["value"])} for r in series_rows if r["value"] is not None]
-    if not history:
-        return []
+def _esc_html(s: str) -> str:
+    return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+             .replace('"',"&quot;").replace("'","&#39;"))
 
-    by_dow = defaultdict(list)
-    last_date = history[-1]["date"]
-    for r in history:
-        by_dow[r["date"].weekday()].append(r["value"])
-
-    def s_naive(next_date: date) -> float:
-        dow = next_date.weekday()
-        vals = by_dow.get(dow, None)
-        if vals:
-            return vals[-1]
-        return history[-1]["value"]
-
-    def ewma_forecast(alpha=0.3):
-        s = history[0]["value"]
-        for r in history[1:]:
-            s = alpha * r["value"] + (1 - alpha) * s
-        return s
-
+def _options(opts: List[str], selected: Optional[str] = None) -> str:
     out = []
-    for r in history:
-        out.append({"date": r["date"], "value": r["value"], "type": "history"})
-    for i in range(1, horizon + 1):
-        next_d = last_date + dt.timedelta(days=i)
-        fv = ewma_forecast() if method == "ewma" else s_naive(next_d)
-        out.append({"date": next_d, "value": float(fv), "type": "forecast"})
-    return out
+    for o in opts:
+        sel = " selected" if selected is not None and o == selected else ""
+        out.append(f"<option value="{_esc_html(o)}"{sel}>{_esc_html(o)}</option>")
+    return "\n".join(out)
 
-def build_csv_bytes(rows):
-    buf = io.StringIO()
-    writer = csv.writer(buf, lineterminator="\n")
-    writer.writerow(["date", "value", "type"])
-    for r in rows:
-        writer.writerow([r["date"], r["value"], r["type"]])
-    data = buf.getvalue().encode("utf-8")
-    buf.close()
-    return data
-
-def _options(opts: List[str]) -> str:
-    return "\n".join([f'<option value="{o}">{o}</option>' for o in opts])
-
-@router.get("/classical", response_class=HTMLResponse)
-def classical_form(request: Request):
-    try:
-        parameters, states, dmin, dmax = list_parameters_and_states()
-        date_min = dmin.isoformat() if dmin else ""
-        date_max = dmax.isoformat() if dmax else ""
-        html = f"""<!doctype html>
+def _page_html(parameters: List[str], states: List[str], dmin: Optional[str], dmax: Optional[str], param_sel: Optional[str]):
+    min_attr = dmin or ""
+    max_attr = dmax or ""
+    return f"""<!doctype html>
 <html><head><meta charset='utf-8'><title>Classical Forecast — Backend Form</title>
 <meta name='viewport' content='width=device-width, initial-scale=1' />
 <style>
@@ -156,7 +146,7 @@ body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Aria
 .wrap {{ max-width: 760px; margin: 0 auto; }}
 form {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
 label {{ display: block; font-weight: 600; margin-bottom: 6px; }}
-input, select {{ width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; }}
+select, input {{ width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; }}
 .full {{ grid-column: 1 / -1; }}
 .actions {{ grid-column: 1 / -1; display: flex; gap: 12px; }}
 button {{ padding: 10px 16px; border: 0; border-radius: 6px; cursor: pointer; }}
@@ -164,73 +154,75 @@ button {{ padding: 10px 16px; border: 0; border-radius: 6px; cursor: pointer; }}
 .muted {{ background: #eee; }}
 </style></head>
 <body><div class='wrap'>
-<h1>Classical Forecast — Backend Form</h1>
-<form method='post' action='/forms/classical/generate'>
-  <div>
-    <label for='parameter'>Parameter</label>
-    <select id='parameter' name='parameter' required>
-      {_options(parameters)}
-    </select>
-  </div>
-  <div>
-    <label for='state_code'>State</label>
-    <select id='state_code' name='state_code' required>
-      {_options(states)}
-    </select>
-  </div>
-  <div>
-    <label for='start_date'>Start date</label>
-    <input type='date' id='start_date' name='start_date' min='{date_min}' max='{date_max}' />
-  </div>
-  <div>
-    <label for='end_date'>End date</label>
-    <input type='date' id='end_date' name='end_date' min='{date_min}' max='{date_max}' />
-  </div>
-  <div>
-    <label for='method'>Method</label>
-    <select id='method' name='method'>
-      <option value='seasonal_naive_dow'>Seasonal Naive (DOW)</option>
-      <option value='ewma'>EWMA</option>
-    </select>
-  </div>
-  <div>
-    <label for='horizon'>Horizon (days)</label>
-    <input type='number' id='horizon' name='horizon' value='30' min='1' max='365' />
-  </div>
-  <div class='actions'>
-    <button class='primary' type='submit'>Generate CSV</button>
-    <a class='muted' href='/forms/classical'><button type='button' class='muted'>Reset</button></a>
-  </div>
-  <div class='full'>
-    <p>On submit, the backend queries history, generates a classical forecast,
-    saves a CSV into <code>staging_historical</code>, and downloads it.</p>
-  </div>
-</form>
+  <h1>Classical Forecast — Backend Form</h1>
+
+  <form method='post' action='/forms/classical/generate'>
+    <div>
+      <label for='param'>Target (Parameter Name)</label>
+      <select id='param' name='param' required>
+        {_options(parameters, selected=param_sel)}
+      </select>
+    </div>
+
+    <div>
+      <label for='state'>State Name</label>
+      <select id='state' name='state' required>
+        {_options(states)}
+      </select>
+    </div>
+
+    <div class='full'>
+      <small>Date range available: <strong>{_esc_html(min_attr)}</strong> to <strong>{_esc_html(max_attr)}</strong> (from "{_esc_html(COL_DATE.strip('"'))}")</small>
+    </div>
+
+    <div class='actions'>
+      <button class='primary' type='submit'>Generate CSV</button>
+      <a class='muted' href='/forms/classical'><button type='button' class='muted'>Reset</button></a>
+    </div>
+  </form>
 </div></body></html>"""
-        return HTMLResponse(content=html, status_code=200)
+
+def _csv_bytes(rows: List[dict]) -> bytes:
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["date","value"])
+    for r in rows:
+        w.writerow([r["date"], r["value"]])
+    data = buf.getvalue().encode("utf-8")
+    buf.close()
+    return data
+
+# ---- Routes ------------------------------------------------------------
+
+@router.get("/classical", response_class=HTMLResponse)
+def classical_form(request: Request, param: Optional[str] = None):
+    try:
+        parameters = list_parameters()
+        # State list depends on selected parameter (if provided)
+        states = list_states_for_param(param if param else None)
+        bounds = date_bounds() or {}
+        dmin = bounds.get("min").isoformat() if bounds.get("min") else ""
+        dmax = bounds.get("max").isoformat() if bounds.get("max") else ""
+        return HTMLResponse(content=_page_html(parameters, states, dmin, dmax, param_sel=param), status_code=200)
     except Exception as e:
         return HTMLResponse(content=f"<pre>Database error: {e}</pre>", status_code=200)
 
 @router.post("/classical/generate")
 def classical_generate(
-    parameter: str = Form(...),
-    state_code: str = Form(...),
-    method: str = Form("seasonal_naive_dow"),
-    horizon: int = Form(30),
-    start_date: Optional[str] = Form(None),
-    end_date: Optional[str] = Form(None),
+    param: str = Form(...),
+    state: str = Form(...),
 ):
     try:
-        history = fetch_series_history(parameter, state_code, start_date, end_date)
-        rows = classical_forecast(history, horizon=horizon, method=method)
+        rows = aggregate_series(param, state)
         if not rows:
-            return JSONResponse({"error": "No data found for selection."}, status_code=400)
+            return JSONResponse({"error": "No data found for that selection."}, status_code=404)
 
-        csv_bytes = build_csv_bytes(rows)
+        csv_bytes = _csv_bytes(rows)
 
-        safe_param = "".join(c for c in parameter if c.isalnum() or c in ("-", "_")).strip("_")
-        safe_state = "".join(c for c in state_code if c.isalnum() or c in ("-", "_")).strip("_")
-        filename = f"classical_{safe_param}_{safe_state}.csv"
+        # Filename based on selection (kept consistent with prior behavior)
+        def _safe(s: str) -> str:
+            return "".join(c for c in s if c.isalnum() or c in ("-", "_")).strip("_")
+        filename = f"classical_{_safe(param)}_{_safe(state)}.csv"
         file_path = os.path.join(STAGING_DIR, filename)
 
         with open(file_path, "wb") as f:
