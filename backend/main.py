@@ -24,4 +24,4 @@ app.include_router(forecast_router)
 app.include_router(meta_router)
 app.include_router(classical_router)
 
-app.include_router(forms_classical_router, prefix="/forms", tags=["forms"])\n
+app.include_router(forms_classical_router, prefix="/forms", tags=["forms"])
