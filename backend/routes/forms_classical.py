@@ -1,11 +1,9 @@
 # =====================================================================
 # File: backend/routes/forms_classical.py
-# Version: v1.1.0 — 2025-09-20
-# Purpose: Serve an HTML form (no Jinja) with DB‑backed drop-downs:
-#   - Target => "Parameter Name"
-#   - Filter => "State Name"
-# Aggregates mean of "Arithmetic Mean" by "Date Local", writes CSV to
-# staging_historical, and streams the file back to the browser.
+# Version: v1.1.1 — 2025-09-20
+# Changes:
+# - v1.1.1: Fix f-string quoting in _options() to avoid SyntaxError.
+# - v1.1.0: DB-backed form; aggregation + CSV save/download.
 # =====================================================================
 
 import csv
@@ -20,7 +18,6 @@ from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 import psycopg
 from psycopg.rows import dict_row
 
-# Where to save CSVs to trigger the pipeline
 STAGING_DIR = os.getenv("STAGING_HISTORICAL_DIR", os.path.join(os.getcwd(), "staging_historical"))
 os.makedirs(STAGING_DIR, exist_ok=True)
 
@@ -28,10 +25,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 router = APIRouter()
 
-# ---- Connection helpers ------------------------------------------------
-
 def _sanitize_conninfo(dsn: str) -> str:
-    """Remove 'channel_binding' if present (URL or DSN form)."""
     if not dsn:
         return dsn
     if '://' in dsn:
@@ -60,8 +54,6 @@ COL_PARAM = '"Parameter Name"'
 COL_STATE = '"State Name"'
 COL_DATE  = '"Date Local"'
 COL_VALUE = '"Arithmetic Mean"'
-
-# ---- DB queries --------------------------------------------------------
 
 def list_parameters() -> List[str]:
     sql = f"""
@@ -122,8 +114,6 @@ def aggregate_series(param: str, state: str):
         cur.execute(sql, (param, state))
         return cur.fetchall()
 
-# ---- HTML helpers ------------------------------------------------------
-
 def _esc_html(s: str) -> str:
     return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
              .replace('"',"&quot;").replace("'","&#39;"))
@@ -132,7 +122,8 @@ def _options(opts: List[str], selected: Optional[str] = None) -> str:
     out = []
     for o in opts:
         sel = " selected" if selected is not None and o == selected else ""
-        out.append(f"<option value="{_esc_html(o)}"{sel}>{_esc_html(o)}</option>")
+        # Fixed quoting: outer string uses single quotes so inner HTML attributes can use double quotes
+        out.append(f'<option value="{_esc_html(o)}"{sel}>{_esc_html(o)}</option>')
     return "\n".join(out)
 
 def _page_html(parameters: List[str], states: List[str], dmin: Optional[str], dmax: Optional[str], param_sel: Optional[str]):
@@ -192,13 +183,10 @@ def _csv_bytes(rows: List[dict]) -> bytes:
     buf.close()
     return data
 
-# ---- Routes ------------------------------------------------------------
-
 @router.get("/classical", response_class=HTMLResponse)
 def classical_form(request: Request, param: Optional[str] = None):
     try:
         parameters = list_parameters()
-        # State list depends on selected parameter (if provided)
         states = list_states_for_param(param if param else None)
         bounds = date_bounds() or {}
         dmin = bounds.get("min").isoformat() if bounds.get("min") else ""
@@ -219,7 +207,6 @@ def classical_generate(
 
         csv_bytes = _csv_bytes(rows)
 
-        # Filename based on selection (kept consistent with prior behavior)
         def _safe(s: str) -> str:
             return "".join(c for c in s if c.isalnum() or c in ("-", "_")).strip("_")
         filename = f"classical_{_safe(param)}_{_safe(state)}.csv"
